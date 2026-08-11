@@ -2,9 +2,11 @@ import { UserError } from '../errors';
 import {
   isOpenAIResponsesCompactionAwareSession,
   isRunContextAwareSession,
+  isSessionHistoryRewriteAwareSession,
   isSessionHistoryTransactionAwareSession,
   type OpenAIResponsesCompactionArgs,
   type Session,
+  type SessionHistoryExpectedFunctionCallMutation,
   type SessionHistoryTransaction,
   type SessionInputCallback,
 } from '../memory/session';
@@ -12,6 +14,10 @@ import { RunResult, StreamedRunResult } from '../result';
 import { RunState } from '../runState';
 import type { RunContext } from '../runContext';
 import { RunItem } from '../items';
+import {
+  sessionHistoryItemsMatch,
+  snapshotSessionHistoryValue,
+} from '../memory/historyMutations';
 import { AgentInputItem } from '../types';
 import { ModelItem } from '../types/protocol';
 import { Usage } from '../usage';
@@ -245,11 +251,16 @@ export function canPersistBlockedOutputToSession(
   );
 }
 
-export async function prepareSessionHistoryTransactionsForRun(
+type SessionHistoryTransactionPreflight = {
+  hasTransactionAuthority: boolean;
+  sessionId?: string;
+};
+
+export async function preflightSessionHistoryTransactionsForRun(
   session: Session | undefined,
   state: RunState<any, any>,
   options: { serverManagesConversation: boolean },
-): Promise<void> {
+): Promise<SessionHistoryTransactionPreflight> {
   const boundSessionId = state._currentTurnSessionHistoryTransactionSessionId;
   const hasTransactionAuthority =
     boundSessionId !== undefined ||
@@ -264,9 +275,6 @@ export async function prepareSessionHistoryTransactionsForRun(
       'RunState cannot combine legacy compaction reconciliation with output guardrail transaction authority.',
     );
   }
-  if (!hasTransactionAuthority) {
-    await reconcileLegacyCompactionSessionBeforeResume(session, state);
-  }
 
   if (
     options.serverManagesConversation ||
@@ -277,7 +285,7 @@ export async function prepareSessionHistoryTransactionsForRun(
         'Output guardrail session persistence must resume with the same transaction-aware local session.',
       );
     }
-    return;
+    return { hasTransactionAuthority };
   }
 
   const sessionId = await session.getSessionId();
@@ -286,6 +294,154 @@ export async function prepareSessionHistoryTransactionsForRun(
       'Output guardrail session persistence belongs to a different session and cannot be resumed safely.',
     );
   }
+  return { hasTransactionAuthority, sessionId };
+}
+
+export async function applySessionHistoryMutationsBeforeRun(
+  session: Session | undefined,
+  state: RunState<any, any>,
+  options: { serverManagesConversation: boolean },
+): Promise<void> {
+  const mutations = state._getValidatedSessionHistoryMutations();
+  if (mutations.length === 0) {
+    return;
+  }
+  if (options.serverManagesConversation) {
+    throw new UserError(
+      'overrideArguments cannot rewrite server-managed conversation history. Resume without conversationId or previousResponseId and use client-managed history.',
+      state,
+    );
+  }
+  if (!session) {
+    if (state._currentTurnPersistedItemCount > 0) {
+      throw new UserError(
+        'overrideArguments must resume with the session that contains the persisted function call.',
+        state,
+      );
+    }
+    return;
+  }
+  if (!isSessionHistoryRewriteAwareSession(session)) {
+    throw new UserError(
+      'overrideArguments requires a session that supports function-call history rewrites, such as MemorySession.',
+      state,
+    );
+  }
+
+  const normalizedMutations =
+    normalizeHistoryMutationsForSessionPersistence(mutations);
+  const history = await getSessionItems(session, state._context);
+  let comparableHistory: AgentInputItem[];
+  try {
+    const snapshottedHistory = snapshotSessionHistoryValue(history);
+    comparableHistory = snapshotSessionHistoryValue(
+      session.prepareHistoryItemsForPersistenceComparison?.(
+        snapshottedHistory,
+      ) ?? snapshottedHistory,
+    );
+  } catch {
+    throw new UserError(
+      'overrideArguments could not safely compare persisted function-call history.',
+      state,
+    );
+  }
+  const pendingMutations: SessionHistoryExpectedFunctionCallMutation[] = [];
+  for (const mutation of normalizedMutations) {
+    let comparableExpectedItems: AgentInputItem[];
+    let comparableReplacementItems: AgentInputItem[];
+    let matchingCall: 'expected' | 'replacement' | undefined;
+    try {
+      comparableExpectedItems = snapshotSessionHistoryValue(
+        session.prepareHistoryItemsForPersistenceComparison?.([
+          mutation.expected,
+        ]) ?? [mutation.expected],
+      );
+      comparableReplacementItems = snapshotSessionHistoryValue(
+        session.prepareHistoryItemsForPersistenceComparison?.([
+          mutation.replacement,
+        ]) ?? [mutation.replacement],
+      );
+      const comparableExpected = comparableExpectedItems[0];
+      const comparableReplacement = comparableReplacementItems[0];
+      if (
+        comparableExpectedItems.length === 1 &&
+        comparableExpected?.type === 'function_call' &&
+        comparableReplacementItems.length === 1 &&
+        comparableReplacement?.type === 'function_call'
+      ) {
+        for (let index = comparableHistory.length - 1; index >= 0; index -= 1) {
+          const item = comparableHistory[index]!;
+          if (
+            item.type !== 'function_call' ||
+            item.callId !== mutation.callId
+          ) {
+            continue;
+          }
+          if (sessionHistoryItemsMatch(item, comparableExpected)) {
+            matchingCall = 'expected';
+            break;
+          }
+          if (sessionHistoryItemsMatch(item, comparableReplacement)) {
+            matchingCall = 'replacement';
+            break;
+          }
+        }
+      }
+    } catch {
+      throw new UserError(
+        'overrideArguments could not safely compare persisted function-call history.',
+        state,
+      );
+    }
+    if (
+      comparableExpectedItems.length !== 1 ||
+      comparableExpectedItems[0]?.type !== 'function_call' ||
+      comparableReplacementItems.length !== 1 ||
+      comparableReplacementItems[0]?.type !== 'function_call'
+    ) {
+      throw new UserError(
+        `overrideArguments could not normalize the persisted function call for call ID ${mutation.callId}.`,
+        state,
+      );
+    }
+    if (!matchingCall) {
+      throw new UserError(
+        `overrideArguments could not find the expected persisted function call for call ID ${mutation.callId}.`,
+        state,
+      );
+    }
+    if (matchingCall === 'expected') {
+      pendingMutations.push(mutation);
+    }
+  }
+
+  if (pendingMutations.length > 0) {
+    const rewriteArgs = { mutations: pendingMutations };
+    if (isRunContextAwareSession(session)) {
+      await session.applyHistoryMutations(rewriteArgs, state._context);
+    } else {
+      await session.applyHistoryMutations(rewriteArgs);
+    }
+  }
+}
+
+export async function prepareSessionHistoryTransactionsForRun(
+  session: Session | undefined,
+  state: RunState<any, any>,
+  options: { serverManagesConversation: boolean },
+  preflight?: SessionHistoryTransactionPreflight,
+): Promise<void> {
+  const { hasTransactionAuthority, sessionId } =
+    preflight ??
+    (await preflightSessionHistoryTransactionsForRun(session, state, options));
+  if (!hasTransactionAuthority) {
+    await reconcileLegacyCompactionSessionBeforeResume(session, state);
+  }
+
+  if (!isSessionHistoryTransactionAwareSession(session) || !sessionId) {
+    return;
+  }
+
   state._currentTurnSessionHistoryTransactionSessionId = sessionId;
   state._currentTurnSessionReasoningItemIdPolicy ??=
     getEffectiveSessionReasoningItemIdPolicy(session, state);
@@ -1455,6 +1611,20 @@ function normalizeItemsForSessionPersistence(
   return deduplicateAgentInputItemsPreferringLatest(
     items.map((item) => sanitizeValueForSession(stripTransientCallIds(item))),
   );
+}
+
+function normalizeHistoryMutationsForSessionPersistence(
+  mutations: SessionHistoryExpectedFunctionCallMutation[],
+): SessionHistoryExpectedFunctionCallMutation[] {
+  return mutations.map((mutation) => ({
+    ...mutation,
+    expected: normalizeItemsForSessionPersistence([
+      mutation.expected,
+    ])[0] as Extract<AgentInputItem, { type: 'function_call' }>,
+    replacement: normalizeItemsForSessionPersistence([
+      mutation.replacement,
+    ])[0] as Extract<AgentInputItem, { type: 'function_call' }>,
+  }));
 }
 
 type SessionBinaryContext = {

@@ -1,9 +1,18 @@
 import { describe, expect, it, vi } from 'vitest';
+import { z } from 'zod';
 
 import {
+  Agent,
   MemorySession,
+  run,
+  tool,
+  Usage,
   UserError,
   type AgentInputItem,
+  type Model,
+  type ModelRequest,
+  type ModelResponse,
+  type ResponseStreamEvent,
 } from '@openai/agents-core';
 
 import { OpenAIResponsesCompactionSession } from '../src';
@@ -90,6 +99,53 @@ class FailingRestoreSession extends MemorySession {
   async clearSession(): Promise<void> {
     this.clearCalls += 1;
     await super.clearSession();
+  }
+}
+
+class BackendMetadataSession extends MemorySession {
+  override async getItems(limit?: number): Promise<AgentInputItem[]> {
+    const items = await super.getItems(limit);
+    return items.map((item) =>
+      item.type === 'function_call'
+        ? { ...item, id: 'backend-assigned-id' }
+        : item,
+    );
+  }
+
+  prepareHistoryItemsForPersistenceComparison(
+    items: AgentInputItem[],
+  ): AgentInputItem[] {
+    return items.map((item) => {
+      if (item.type !== 'function_call') {
+        return item;
+      }
+      const { id: _backendId, ...functionCall } = item;
+      return functionCall;
+    });
+  }
+}
+
+class ApprovalModel implements Model {
+  async getResponse(_request: ModelRequest): Promise<ModelResponse> {
+    return {
+      usage: new Usage(),
+      output: [
+        {
+          type: 'function_call',
+          name: 'lookup',
+          callId: 'call_compaction_override',
+          status: 'completed',
+          arguments: JSON.stringify({ query: 'old' }),
+        },
+      ],
+    };
+  }
+
+  // eslint-disable-next-line require-yield -- this focused model does not stream.
+  async *getStreamedResponse(
+    _request: ModelRequest,
+  ): AsyncIterable<ResponseStreamEvent> {
+    throw new Error('Streaming is not supported in this focused model.');
   }
 }
 
@@ -204,6 +260,106 @@ describe('OpenAIResponsesCompactionSession', () => {
 
     expect(candidateSnapshots).toEqual([[assistantItem], [assistantItem], []]);
     await expect(session.getItems()).resolves.toEqual([]);
+  });
+
+  it('forwards history rewrites and invalidates cached compaction input', async () => {
+    const originalCall = {
+      type: 'function_call',
+      name: 'lookup',
+      callId: 'call_rewrite',
+      status: 'completed',
+      arguments: JSON.stringify({ query: 'old' }),
+    } as Extract<AgentInputItem, { type: 'function_call' }>;
+    const replacementCall = {
+      ...originalCall,
+      arguments: JSON.stringify({ query: 'new' }),
+    };
+    const candidateSnapshots: AgentInputItem[][] = [];
+    const session = new OpenAIResponsesCompactionSession({
+      client: { responses: { compact: vi.fn() } } as any,
+      underlyingSession: new MemorySession({ initialItems: [originalCall] }),
+      shouldTriggerCompaction: ({ compactionCandidateItems }) => {
+        candidateSnapshots.push(compactionCandidateItems);
+        return false;
+      },
+    });
+
+    await session.runCompaction();
+    await session.applyHistoryMutations({
+      mutations: [
+        {
+          type: 'replace_function_call',
+          callId: 'call_rewrite',
+          expected: originalCall,
+          replacement: replacementCall,
+        },
+      ],
+    });
+    await session.runCompaction();
+
+    expect(candidateSnapshots).toEqual([[originalCall], [replacementCall]]);
+    await expect(session.getItems()).resolves.toEqual([replacementCall]);
+  });
+
+  it('delegates persistence comparison normalization before a resumed rewrite', async () => {
+    let executedQuery: string | undefined;
+    const lookup = tool({
+      name: 'lookup',
+      description: 'Looks up a query after approval.',
+      parameters: z.object({ query: z.string() }),
+      needsApproval: async () => true,
+      execute: async ({ query }) => {
+        executedQuery = query;
+        return query;
+      },
+    });
+    const underlyingSession = new BackendMetadataSession();
+    const session = new OpenAIResponsesCompactionSession({
+      client: { responses: { compact: vi.fn() } } as any,
+      underlyingSession,
+    });
+    const agent = new Agent({
+      name: 'CompactionOverrideAgent',
+      model: new ApprovalModel(),
+      tools: [lookup],
+      toolUseBehavior: 'stop_on_first_tool',
+    });
+    const firstResult = await run(agent, 'query', { session });
+    firstResult.state.approve(firstResult.interruptions[0]!, {
+      overrideArguments: { query: 'new' },
+    });
+
+    const resumed = await run(agent, firstResult.state, { session });
+
+    expect(resumed.finalOutput).toBe('new');
+    expect(executedQuery).toBe('new');
+    await expect(session.getItems()).resolves.toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          type: 'function_call',
+          id: 'backend-assigned-id',
+          callId: 'call_compaction_override',
+          arguments: JSON.stringify({ query: 'new' }),
+        }),
+      ]),
+    );
+  });
+
+  it('rejects history rewrites when the underlying session cannot rewrite', async () => {
+    const underlyingSession = new MemorySession();
+    Object.defineProperty(underlyingSession, 'applyHistoryMutations', {
+      value: undefined,
+    });
+    const session = new OpenAIResponsesCompactionSession({
+      client: { responses: { compact: vi.fn() } } as any,
+      underlyingSession,
+    });
+
+    await expect(
+      session.applyHistoryMutations({ mutations: [] }),
+    ).rejects.toThrow(
+      'requires its underlying session to support function-call history rewrites',
+    );
   });
 
   it('uses the default compaction threshold for candidate items', async () => {

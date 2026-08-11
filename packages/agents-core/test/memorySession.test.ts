@@ -147,6 +147,14 @@ describe('MemorySession', () => {
         },
       ],
     });
+    const expected = {
+      type: 'function_call',
+      id: 'call-old-2',
+      callId: 'call-1',
+      name: 'lookup',
+      status: 'completed',
+      arguments: '{"duplicate":true}',
+    } satisfies AgentInputItem;
     const replacement = {
       type: 'function_call',
       id: 'call-new',
@@ -161,6 +169,7 @@ describe('MemorySession', () => {
         {
           type: 'replace_function_call',
           callId: 'call-1',
+          expected,
           replacement,
         },
       ],
@@ -168,6 +177,14 @@ describe('MemorySession', () => {
 
     expect(await session.getItems()).toEqual([
       createUserMessage('start'),
+      {
+        type: 'function_call',
+        id: 'call-old-1',
+        callId: 'call-1',
+        name: 'lookup',
+        status: 'completed',
+        arguments: '{"ok":false}',
+      },
       replacement,
     ]);
   });

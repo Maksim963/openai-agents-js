@@ -51,6 +51,7 @@ import type {
   ToolOutputGuardrailResult,
 } from './toolGuardrail';
 import { safeExecute } from './utils/safeExecute';
+import { snapshotRawUsage } from './utils/rawUsage';
 import {
   getClientToolSearchExecutor,
   getToolSearchRuntimeRoutingKey,
@@ -61,6 +62,12 @@ import {
   Tool,
 } from './tool';
 import type { AgentToolInvocation } from './agentToolInvocation';
+import type { SessionHistoryExpectedFunctionCallMutation } from './memory/session';
+import {
+  sessionHistoryValuesMatch,
+  snapshotSessionHistoryMutations,
+  snapshotSessionHistoryValue,
+} from './memory/historyMutations';
 import {
   buildFunctionToolLookupMap,
   type FunctionToolLookupKey,
@@ -157,8 +164,9 @@ import {
  *   scopes persistent hosted MCP approvals by server label and tool name, preserves
  *   JSON-compatible tool outputs as structured data, and adds durable pending input
  *   and accepted-response resume state.
+ * - 1.19: Adds pending function-call history mutations for approval argument overrides.
  */
-export const CURRENT_SCHEMA_VERSION = '1.18' as const;
+export const CURRENT_SCHEMA_VERSION = '1.19' as const;
 export const SUPPORTED_SCHEMA_VERSIONS = [
   '1.0',
   '1.1',
@@ -178,6 +186,7 @@ export const SUPPORTED_SCHEMA_VERSIONS = [
   '1.15',
   '1.16',
   '1.17',
+  '1.18',
   CURRENT_SCHEMA_VERSION,
 ] as const;
 type SupportedSchemaVersion = (typeof SUPPORTED_SCHEMA_VERSIONS)[number];
@@ -186,7 +195,7 @@ const $schemaVersion = z.enum(SUPPORTED_SCHEMA_VERSIONS);
 function schemaVersionSupportsV118State(
   schemaVersion: SupportedSchemaVersion,
 ): boolean {
-  return schemaVersion === CURRENT_SCHEMA_VERSION;
+  return schemaVersion === '1.18' || schemaVersion === CURRENT_SCHEMA_VERSION;
 }
 
 function schemaVersionSupportsV116State(
@@ -224,6 +233,15 @@ const pendingSessionHistoryTransactionSchema = z
 type PendingSessionHistoryTransaction = z.infer<
   typeof pendingSessionHistoryTransactionSchema
 >;
+
+const sessionHistoryMutationSchema = z.discriminatedUnion('type', [
+  z.object({
+    type: z.literal('replace_function_call'),
+    callId: z.string().min(1),
+    expected: protocol.FunctionCallItem,
+    replacement: protocol.FunctionCallItem,
+  }),
+]);
 
 type RunStateContextOverrideOptions<TContext> = {
   contextOverride?: RunContext<TContext>;
@@ -1733,11 +1751,123 @@ export const SerializedRunState = z.object({
   conversationId: z.string().optional(),
   previousResponseId: z.string().optional(),
   reasoningItemIdPolicy: z.enum(['preserve', 'omit']).optional(),
+  sessionHistoryMutations: z
+    .array(sessionHistoryMutationSchema)
+    .optional()
+    .default([]),
   trace: serializedTraceSchema.nullable(),
   sandbox: sandboxStateSchema.optional(),
 });
 
 export type FinalOutputSource = 'error_handler' | 'turn_resolution';
+
+type ApproveRunToolOptions = {
+  alwaysApprove?: boolean;
+  overrideArguments?: object;
+};
+
+type PendingFunctionCallReplacementPlan = {
+  runItemTargets: Array<RunToolCallItem | RunToolApprovalItem>;
+  functionTargets: Array<{ toolCall: protocol.FunctionCallItem }>;
+  legacySessionItems: protocol.ModelItem[] | undefined;
+  sessionHistoryMutations: SessionHistoryExpectedFunctionCallMutation[];
+};
+
+function getOwnDataProperty<T>(
+  owner: object,
+  key: PropertyKey,
+): { value: T; writable: boolean } {
+  const descriptor = Object.getOwnPropertyDescriptor(owner, key);
+  if (!descriptor || !('value' in descriptor)) {
+    throw new TypeError(`Expected ${String(key)} to be an own data property.`);
+  }
+  return {
+    value: descriptor.value as T,
+    writable: descriptor.writable === true,
+  };
+}
+
+function assertWritableDataProperty(
+  property: { writable: boolean },
+  key: PropertyKey,
+): void {
+  if (!property.writable) {
+    throw new TypeError(`Expected ${String(key)} to be writable.`);
+  }
+}
+
+function assertNoEnumerableAccessors(
+  value: unknown,
+  ancestors = new Set<object>(),
+): void {
+  if (value === null || typeof value !== 'object' || ancestors.has(value)) {
+    return;
+  }
+
+  ancestors.add(value);
+  try {
+    for (const descriptor of Object.values(
+      Object.getOwnPropertyDescriptors(value),
+    )) {
+      if (!descriptor.enumerable) {
+        continue;
+      }
+      if (!('value' in descriptor)) {
+        throw new TypeError('Accessor-backed JSON data is unsupported.');
+      }
+      assertNoEnumerableAccessors(descriptor.value, ancestors);
+    }
+  } finally {
+    ancestors.delete(value);
+  }
+}
+
+function isSameFunctionCall(
+  candidate: protocol.FunctionCallItem,
+  expected: protocol.FunctionCallItem,
+): boolean {
+  assertNoEnumerableAccessors(candidate.providerData);
+  assertNoEnumerableAccessors(expected.providerData);
+  return (
+    candidate.id === expected.id &&
+    candidate.callId === expected.callId &&
+    candidate.name === expected.name &&
+    candidate.namespace === expected.namespace &&
+    candidate.arguments === expected.arguments &&
+    candidate.status === expected.status &&
+    JSON.stringify(getCanonicalToolCaller(candidate)) ===
+      JSON.stringify(getCanonicalToolCaller(expected)) &&
+    (candidate.providerData === undefined || expected.providerData === undefined
+      ? candidate.providerData === expected.providerData
+      : sessionHistoryValuesMatch(
+          candidate.providerData,
+          expected.providerData,
+        ))
+  );
+}
+
+function snapshotExpectedSessionHistoryMutation(
+  mutation: SessionHistoryExpectedFunctionCallMutation,
+): SessionHistoryExpectedFunctionCallMutation {
+  const [snapshot] = snapshotSessionHistoryMutations([mutation]);
+  if (snapshot?.expected === undefined) {
+    throw new TypeError('Expected-bearing session history mutation required.');
+  }
+  return snapshot as SessionHistoryExpectedFunctionCallMutation;
+}
+
+function getFunctionApprovalStateKey(
+  toolCall: protocol.FunctionCallItem,
+  functionToolStateKey: string | undefined,
+  toolName: string | undefined,
+): string {
+  return (
+    functionToolStateKey ??
+    getFunctionToolStateKeyForCall(toolCall, toolName ?? toolCall.name) ??
+    toolName ??
+    toolCall.name
+  );
+}
 
 type ToolSearchRuntimeToolEntry<TContext = UnknownContext> = {
   order: number;
@@ -1927,6 +2057,12 @@ export class RunState<TContext, TAgent extends Agent<any, any>> {
    */
   public _pendingLegacyCompactionSessionItems: AgentInputItem[] | undefined;
   /**
+   * Function-call replacements that must be applied to local session history before resume.
+   *
+   * @internal
+   */
+  public _sessionHistoryMutations: SessionHistoryExpectedFunctionCallMutation[];
+  /**
    * Maximum allowed turns before forcing termination.
    */
   public _maxTurns: number | null;
@@ -2020,6 +2156,7 @@ export class RunState<TContext, TAgent extends Agent<any, any>> {
     this._sessionHistoryTransactionId = randomUUID();
     this._pendingSessionHistoryTransaction = undefined;
     this._pendingLegacyCompactionSessionItems = undefined;
+    this._sessionHistoryMutations = [];
     this._maxTurns = maxTurns;
     this._inputGuardrailResults = [];
     this._outputGuardrailResults = [];
@@ -2495,14 +2632,627 @@ export class RunState<TContext, TAgent extends Agent<any, any>> {
    * @param approvalItem - The tool call approval item to approve.
    * @param options - Options for the approval.
    * @param options.alwaysApprove - Approve this tool for all future calls in this run.
+   * @param options.overrideArguments - Replace this function call's arguments before execution.
    */
   approve(
     approvalItem: RunToolApprovalItem,
-    options: { alwaysApprove?: boolean } = {
+    options: ApproveRunToolOptions = {
       alwaysApprove: false,
     },
   ) {
-    this._context.approveTool(approvalItem, options);
+    const { alwaysApprove = false, overrideArguments } = options;
+    if (overrideArguments === undefined) {
+      this._context.approveTool(approvalItem, { alwaysApprove });
+      return;
+    }
+
+    this.applyApprovalArgumentOverride(approvalItem, overrideArguments, {
+      alwaysApprove,
+    });
+  }
+
+  private applyApprovalArgumentOverride(
+    approvalItem: RunToolApprovalItem,
+    overrideArguments: object,
+    options: { alwaysApprove: boolean },
+  ): void {
+    if (options.alwaysApprove) {
+      throw new UserError(
+        'overrideArguments cannot be used together with alwaysApprove.',
+        this,
+      );
+    }
+    let rawItemProperty: {
+      value: RunToolApprovalItem['rawItem'];
+      writable: boolean;
+    };
+    let rawItemSnapshot: RunToolApprovalItem['rawItem'];
+    let approvalAgent: Agent<any, any>;
+    let approvalToolName: string | undefined;
+    let approvalFunctionToolStateKey: string | undefined;
+    try {
+      rawItemProperty = getOwnDataProperty(approvalItem, 'rawItem');
+      rawItemSnapshot = snapshotSessionHistoryValue(rawItemProperty.value);
+      approvalAgent = getOwnDataProperty<Agent<any, any>>(
+        approvalItem,
+        'agent',
+      ).value;
+      approvalToolName = getOwnDataProperty<string | undefined>(
+        approvalItem,
+        'toolName',
+      ).value;
+      approvalFunctionToolStateKey = getOwnDataProperty<string | undefined>(
+        approvalItem,
+        'functionToolStateKey',
+      ).value;
+      if (
+        (approvalToolName !== undefined &&
+          typeof approvalToolName !== 'string') ||
+        (approvalFunctionToolStateKey !== undefined &&
+          typeof approvalFunctionToolStateKey !== 'string')
+      ) {
+        throw new TypeError('Invalid approval item metadata.');
+      }
+    } catch {
+      throw new UserError(
+        'The pending function call cannot be represented in a durable history mutation.',
+        this,
+      );
+    }
+    if (rawItemSnapshot.type !== 'function_call') {
+      throw new UserError(
+        'overrideArguments is only supported for function_call approvals.',
+        this,
+      );
+    }
+    try {
+      assertWritableDataProperty(rawItemProperty, 'rawItem');
+    } catch {
+      throw new UserError(
+        'The pending function call cannot be represented in a durable history mutation.',
+        this,
+      );
+    }
+    const originalToolCallSnapshot = rawItemSnapshot;
+    if (approvalAgent !== this._currentAgent) {
+      throw new UserError(
+        'overrideArguments is only supported for function_call approvals owned directly by the current RunState. Approve nested agent-tool interruptions without overrideArguments.',
+        this,
+      );
+    }
+    if (this._conversationId || this._previousResponseId) {
+      throw new UserError(
+        'overrideArguments cannot rewrite server-managed conversation history. Resume without conversationId or previousResponseId and use client-managed history.',
+        this,
+      );
+    }
+    const pendingApproval = this.getInterruptions().find(
+      (interruption) => interruption === approvalItem,
+    );
+    if (!pendingApproval) {
+      throw new UserError(
+        'overrideArguments can only update a pending function_call approval.',
+        this,
+      );
+    }
+
+    let serializedArguments: string;
+    try {
+      const prototype = Object.getPrototypeOf(overrideArguments);
+      if (
+        overrideArguments === null ||
+        typeof overrideArguments !== 'object' ||
+        Array.isArray(overrideArguments) ||
+        (prototype !== Object.prototype && prototype !== null)
+      ) {
+        throw new TypeError('Invalid override argument object.');
+      }
+      const snapshottedArguments =
+        snapshotSessionHistoryValue(overrideArguments);
+      serializedArguments = JSON.stringify(snapshottedArguments);
+      const serializedValue = JSON.parse(serializedArguments);
+      if (
+        serializedValue === null ||
+        typeof serializedValue !== 'object' ||
+        Array.isArray(serializedValue)
+      ) {
+        throw new TypeError('Invalid serialized override arguments.');
+      }
+    } catch {
+      throw new UserError(
+        'overrideArguments must be a JSON-serializable plain object.',
+        this,
+      );
+    }
+
+    const candidateToolCall: protocol.FunctionCallItem = {
+      ...originalToolCallSnapshot,
+      arguments: serializedArguments,
+    };
+    let updatedToolCall: protocol.FunctionCallItem;
+    let sessionHistoryMutation: SessionHistoryExpectedFunctionCallMutation;
+    try {
+      let providerData: Record<string, unknown> | undefined;
+      if (candidateToolCall.providerData !== undefined) {
+        assertNoEnumerableAccessors(candidateToolCall.providerData);
+        providerData = snapshotRawUsage(candidateToolCall.providerData);
+      }
+      if (
+        candidateToolCall.providerData !== undefined &&
+        providerData === undefined
+      ) {
+        throw new TypeError('Invalid provider data.');
+      }
+      const mutationCandidate: SessionHistoryExpectedFunctionCallMutation = {
+        type: 'replace_function_call',
+        callId: candidateToolCall.callId,
+        expected: {
+          ...originalToolCallSnapshot,
+          ...(providerData === undefined ? {} : { providerData }),
+        },
+        replacement: {
+          ...candidateToolCall,
+          ...(providerData === undefined ? {} : { providerData }),
+        },
+      };
+      const snapshottedMutation =
+        snapshotExpectedSessionHistoryMutation(mutationCandidate);
+      const parsedMutation =
+        sessionHistoryMutationSchema.parse(snapshottedMutation);
+      const executableMutation =
+        snapshotExpectedSessionHistoryMutation(parsedMutation);
+      updatedToolCall = executableMutation.replacement;
+      sessionHistoryMutation =
+        snapshotExpectedSessionHistoryMutation(executableMutation);
+    } catch {
+      throw new UserError(
+        'The pending function call cannot be represented in a durable history mutation.',
+        this,
+      );
+    }
+    const toolName = getFunctionApprovalStateKey(
+      originalToolCallSnapshot,
+      approvalFunctionToolStateKey,
+      approvalToolName,
+    );
+    const callId = originalToolCallSnapshot.callId;
+    const originalFingerprint = getToolInvocationFingerprint(
+      toolName,
+      originalToolCallSnapshot,
+    );
+    const updatedFingerprint = getToolInvocationFingerprint(
+      toolName,
+      updatedToolCall,
+    );
+    let replacementPlan: PendingFunctionCallReplacementPlan;
+    try {
+      replacementPlan = this.preparePendingFunctionCallReplacement(
+        approvalItem,
+        originalToolCallSnapshot,
+        updatedToolCall,
+        sessionHistoryMutation,
+        approvalAgent,
+      );
+    } catch {
+      throw new UserError(
+        'The pending function call cannot be represented in a durable history mutation.',
+        this,
+      );
+    }
+    this._context._validateToolInvocation(
+      approvalAgent,
+      toolName,
+      updatedToolCall,
+    );
+    const observedInvocations =
+      this.preparePendingFunctionCallFingerprintTransition(
+        approvalAgent,
+        callId,
+        originalFingerprint,
+      );
+
+    const updatedApprovalItem = new RunToolApprovalItem(
+      updatedToolCall,
+      approvalAgent,
+      approvalToolName,
+      approvalFunctionToolStateKey,
+    );
+
+    try {
+      this.applyPendingFunctionCallReplacement(
+        replacementPlan,
+        updatedToolCall,
+      );
+    } catch {
+      throw new UserError(
+        'The pending function call cannot be represented in a durable history mutation.',
+        this,
+      );
+    }
+
+    this._context.approveTool(updatedApprovalItem);
+    observedInvocations?.set(callId, updatedFingerprint);
+  }
+
+  private preparePendingFunctionCallFingerprintTransition(
+    agent: Agent<any, any>,
+    callId: string,
+    originalFingerprint: string,
+  ): Map<string, string> | undefined {
+    if (this._ambiguousToolInvocationCallIds.get(agent)?.has(callId)) {
+      throw new UserError(
+        `Cannot override arguments for ambiguous function call ${callId}.`,
+        this,
+      );
+    }
+    if (this._completedToolInvocations.get(agent)?.has(callId)) {
+      throw new UserError(
+        `Cannot override arguments after function call ${callId} has completed.`,
+        this,
+      );
+    }
+
+    const observedInvocations = this._observedToolInvocations.get(agent);
+    const observedFingerprint = observedInvocations?.get(callId);
+    if (
+      observedFingerprint !== undefined &&
+      observedFingerprint !== originalFingerprint
+    ) {
+      throw new ModelBehaviorError(
+        `Tool call ID ${callId} was reused for different tool invocations in the same run.`,
+        this,
+      );
+    }
+    return observedFingerprint === undefined ? undefined : observedInvocations;
+  }
+
+  private preparePendingFunctionCallReplacement(
+    approvalItem: RunToolApprovalItem,
+    originalToolCall: protocol.FunctionCallItem,
+    updatedToolCall: protocol.FunctionCallItem,
+    sessionHistoryMutation: SessionHistoryExpectedFunctionCallMutation,
+    approvalAgent: Agent<any, any>,
+  ): PendingFunctionCallReplacementPlan {
+    const runItemTargets = new Set<RunToolCallItem | RunToolApprovalItem>([
+      approvalItem,
+    ]);
+    this.collectFunctionCallReplacementTargets(
+      runItemTargets,
+      this._generatedItems,
+      approvalAgent,
+      originalToolCall,
+    );
+    this.collectFunctionCallReplacementTargets(
+      runItemTargets,
+      this._lastProcessedResponse?.newItems ?? [],
+      approvalAgent,
+      originalToolCall,
+    );
+    for (const interruption of this.getInterruptions()) {
+      const interruptionAgent = getOwnDataProperty<Agent<any, any>>(
+        interruption,
+        'agent',
+      ).value;
+      const rawItemProperty = getOwnDataProperty<
+        RunToolApprovalItem['rawItem']
+      >(interruption, 'rawItem');
+      const rawItem = snapshotSessionHistoryValue(rawItemProperty.value);
+      if (
+        interruptionAgent === approvalAgent &&
+        rawItem.type === 'function_call' &&
+        isSameFunctionCall(rawItem, originalToolCall)
+      ) {
+        assertWritableDataProperty(rawItemProperty, 'rawItem');
+        runItemTargets.add(interruption);
+      }
+    }
+
+    const functionTargets: Array<{
+      toolCall: protocol.FunctionCallItem;
+    }> = [];
+    for (const functionRun of this._lastProcessedResponse?.functions ?? []) {
+      const toolCallProperty = getOwnDataProperty<protocol.FunctionCallItem>(
+        functionRun,
+        'toolCall',
+      );
+      const toolCall = snapshotSessionHistoryValue(toolCallProperty.value);
+      if (isSameFunctionCall(toolCall, originalToolCall)) {
+        assertWritableDataProperty(toolCallProperty, 'toolCall');
+        functionTargets.push(functionRun);
+      }
+    }
+
+    const legacySessionItemsProperty = getOwnDataProperty<
+      AgentInputItem[] | undefined
+    >(this, '_pendingLegacyCompactionSessionItems');
+    const legacySessionItems = legacySessionItemsProperty.value
+      ? legacySessionItemsProperty.value.map((item) => {
+          const itemSnapshot = snapshotSessionHistoryValue(item);
+          return itemSnapshot.type === 'function_call' &&
+            isSameFunctionCall(itemSnapshot, originalToolCall)
+            ? updatedToolCall
+            : itemSnapshot;
+        })
+      : undefined;
+    if (legacySessionItems !== undefined) {
+      assertWritableDataProperty(
+        legacySessionItemsProperty,
+        '_pendingLegacyCompactionSessionItems',
+      );
+    }
+
+    const sessionHistoryMutationsProperty = getOwnDataProperty<unknown>(
+      this,
+      '_sessionHistoryMutations',
+    );
+    assertWritableDataProperty(
+      sessionHistoryMutationsProperty,
+      '_sessionHistoryMutations',
+    );
+    if (!Array.isArray(sessionHistoryMutationsProperty.value)) {
+      throw new TypeError('Invalid session history mutation storage.');
+    }
+    const sessionHistoryMutations = sessionHistoryMutationsProperty.value.map(
+      snapshotExpectedSessionHistoryMutation,
+    );
+    const existingMutationIndex = sessionHistoryMutations.findIndex(
+      (existing) =>
+        existing.type === sessionHistoryMutation.type &&
+        existing.callId === sessionHistoryMutation.callId,
+    );
+    if (existingMutationIndex >= 0) {
+      const existingMutation = sessionHistoryMutations[existingMutationIndex]!;
+      if (!isSameFunctionCall(existingMutation.replacement, originalToolCall)) {
+        throw new TypeError('Invalid repeated session history mutation.');
+      }
+      sessionHistoryMutations[existingMutationIndex] = {
+        ...sessionHistoryMutation,
+        expected: existingMutation.expected,
+      };
+    } else {
+      sessionHistoryMutations.push(sessionHistoryMutation);
+    }
+
+    return {
+      runItemTargets: [...runItemTargets],
+      functionTargets,
+      legacySessionItems,
+      sessionHistoryMutations,
+    };
+  }
+
+  private collectFunctionCallReplacementTargets(
+    targets: Set<RunToolCallItem | RunToolApprovalItem>,
+    items: RunItem[],
+    agent: Agent<any, any>,
+    originalToolCall: protocol.FunctionCallItem,
+  ): void {
+    for (const item of items) {
+      if (
+        (item.type !== 'tool_call_item' &&
+          item.type !== 'tool_approval_item') ||
+        getOwnDataProperty<Agent<any, any>>(item, 'agent').value !== agent
+      ) {
+        continue;
+      }
+      const rawItemProperty = getOwnDataProperty<
+        RunToolCallItem['rawItem'] | RunToolApprovalItem['rawItem']
+      >(item, 'rawItem');
+      const rawItem = snapshotSessionHistoryValue(rawItemProperty.value);
+      if (
+        rawItem.type !== 'function_call' ||
+        !isSameFunctionCall(rawItem, originalToolCall)
+      ) {
+        continue;
+      }
+      assertWritableDataProperty(rawItemProperty, 'rawItem');
+      targets.add(item);
+    }
+  }
+
+  private applyPendingFunctionCallReplacement(
+    plan: PendingFunctionCallReplacementPlan,
+    updatedToolCall: protocol.FunctionCallItem,
+  ): void {
+    for (const item of plan.runItemTargets) {
+      item.rawItem = updatedToolCall;
+    }
+    for (const functionRun of plan.functionTargets) {
+      functionRun.toolCall = updatedToolCall;
+    }
+    if (plan.legacySessionItems) {
+      this._pendingLegacyCompactionSessionItems = plan.legacySessionItems;
+    }
+    this._sessionHistoryMutations = plan.sessionHistoryMutations;
+  }
+
+  /** @internal */
+  _getSessionHistoryMutations(): SessionHistoryExpectedFunctionCallMutation[] {
+    try {
+      return this._sessionHistoryMutations.map(
+        snapshotExpectedSessionHistoryMutation,
+      );
+    } catch {
+      throw new UserError(
+        'RunState contains an invalid function-call history mutation.',
+        this,
+      );
+    }
+  }
+
+  /** @internal */
+  _getValidatedSessionHistoryMutations(): SessionHistoryExpectedFunctionCallMutation[] {
+    const mutations = this._getSessionHistoryMutations();
+    const interruptions = this.getInterruptions();
+    const seenCallIds = new Set<string>();
+
+    for (const mutation of mutations) {
+      if (
+        seenCallIds.has(mutation.callId) ||
+        mutation.callId !== mutation.expected.callId ||
+        mutation.callId !== mutation.replacement.callId
+      ) {
+        throw new UserError(
+          `RunState contains an invalid function-call history mutation for call ID ${mutation.callId}.`,
+          this,
+        );
+      }
+      seenCallIds.add(mutation.callId);
+
+      if (
+        !isSameFunctionCall(
+          {
+            ...mutation.expected,
+            arguments: mutation.replacement.arguments,
+          },
+          mutation.replacement,
+        )
+      ) {
+        throw new UserError(
+          `RunState history mutation for call ID ${mutation.callId} changes function-call identity.`,
+          this,
+        );
+      }
+
+      let matchingOriginalCalls: protocol.FunctionCallItem[];
+      try {
+        matchingOriginalCalls = (this._lastTurnResponse?.output ?? []).filter(
+          (item): item is protocol.FunctionCallItem =>
+            item.type === 'function_call' &&
+            isSameFunctionCall(item, mutation.expected),
+        );
+      } catch {
+        throw new UserError(
+          `RunState contains an invalid function-call history mutation for call ID ${mutation.callId}.`,
+          this,
+        );
+      }
+      if (matchingOriginalCalls.length !== 1) {
+        throw new UserError(
+          `RunState history mutation for call ID ${mutation.callId} is not bound to exactly one original model function call.`,
+          this,
+        );
+      }
+
+      let matchingApprovals: RunToolApprovalItem[];
+      try {
+        matchingApprovals = interruptions.filter((interruption) => {
+          const agent = getOwnDataProperty<Agent<any, any>>(
+            interruption,
+            'agent',
+          ).value;
+          const rawItem = snapshotSessionHistoryValue(
+            getOwnDataProperty<RunToolApprovalItem['rawItem']>(
+              interruption,
+              'rawItem',
+            ).value,
+          );
+          return (
+            agent === this._currentAgent &&
+            rawItem.type === 'function_call' &&
+            isSameFunctionCall(rawItem, mutation.replacement)
+          );
+        });
+      } catch {
+        throw new UserError(
+          `RunState contains an invalid function-call history mutation for call ID ${mutation.callId}.`,
+          this,
+        );
+      }
+      if (matchingApprovals.length !== 1) {
+        throw new UserError(
+          `RunState history mutation for call ID ${mutation.callId} is not bound to exactly one pending function_call approval.`,
+          this,
+        );
+      }
+
+      const approvalItem = matchingApprovals[0]!;
+      let approvalAgent: Agent<any, any>;
+      let approvalToolName: string | undefined;
+      let approvalFunctionToolStateKey: string | undefined;
+      try {
+        approvalAgent = getOwnDataProperty<Agent<any, any>>(
+          approvalItem,
+          'agent',
+        ).value;
+        approvalToolName = getOwnDataProperty<string | undefined>(
+          approvalItem,
+          'toolName',
+        ).value;
+        approvalFunctionToolStateKey = getOwnDataProperty<string | undefined>(
+          approvalItem,
+          'functionToolStateKey',
+        ).value;
+        if (
+          (approvalToolName !== undefined &&
+            typeof approvalToolName !== 'string') ||
+          (approvalFunctionToolStateKey !== undefined &&
+            typeof approvalFunctionToolStateKey !== 'string')
+        ) {
+          throw new TypeError('Invalid approval item metadata.');
+        }
+      } catch {
+        throw new UserError(
+          `RunState contains an invalid function-call history mutation for call ID ${mutation.callId}.`,
+          this,
+        );
+      }
+      const toolName = getFunctionApprovalStateKey(
+        mutation.replacement,
+        approvalFunctionToolStateKey,
+        approvalToolName,
+      );
+      if (
+        this._context._resolveToolInvocationApproval(
+          approvalAgent,
+          toolName,
+          mutation.replacement,
+        ) !== true
+      ) {
+        throw new UserError(
+          `RunState history mutation for call ID ${mutation.callId} is not bound to an approved function call.`,
+          this,
+        );
+      }
+    }
+
+    return mutations;
+  }
+
+  /** @internal */
+  _prepareSessionHistoryMutationClear(): (() => void) | undefined {
+    try {
+      const property = getOwnDataProperty<unknown>(
+        this,
+        '_sessionHistoryMutations',
+      );
+      if (!Array.isArray(property.value)) {
+        throw new TypeError('Invalid session history mutation storage.');
+      }
+      if (property.value.length === 0) {
+        return undefined;
+      }
+      assertWritableDataProperty(property, '_sessionHistoryMutations');
+      const lengthDescriptor = Object.getOwnPropertyDescriptor(
+        property.value,
+        'length',
+      );
+      if (
+        lengthDescriptor?.writable !== true ||
+        !Object.isExtensible(property.value)
+      ) {
+        throw new TypeError('Invalid session history mutation storage.');
+      }
+      const storage = property.value;
+      return () => {
+        storage.length = 0;
+      };
+    } catch {
+      throw new UserError(
+        'RunState contains invalid function-call history mutation storage.',
+        this,
+      );
+    }
   }
 
   /**
@@ -2782,6 +3532,7 @@ export class RunState<TContext, TAgent extends Agent<any, any>> {
       conversationId: this._conversationId,
       previousResponseId: this._previousResponseId,
       reasoningItemIdPolicy: this._reasoningItemIdPolicy,
+      sessionHistoryMutations: this._getSessionHistoryMutations(),
       trace: this._trace
         ? (this._trace.toJSON({ includeTracingApiKey }) as any)
         : null,
@@ -2869,6 +3620,18 @@ async function buildRunStateFromString<
     currentSchemaVersion as SupportedSchemaVersion,
     jsonResult,
   );
+  if (
+    currentSchemaVersion !== CURRENT_SCHEMA_VERSION &&
+    jsonResult !== null &&
+    typeof jsonResult === 'object' &&
+    hasOwnProperty(jsonResult, 'sessionHistoryMutations') &&
+    (!Array.isArray(jsonResult.sessionHistoryMutations) ||
+      jsonResult.sessionHistoryMutations.length > 0)
+  ) {
+    throw new UserError(
+      `Run state schema version ${currentSchemaVersion} does not support function-call history mutations. Please reserialize the run state with schema ${CURRENT_SCHEMA_VERSION}.`,
+    );
+  }
   const hasPendingInputField =
     jsonResult !== null &&
     typeof jsonResult === 'object' &&
@@ -5396,6 +6159,9 @@ async function buildRunStateFromJson<TContext, TAgent extends Agent<any, any>>(
   state._conversationId = stateJson.conversationId ?? undefined;
   state._previousResponseId = stateJson.previousResponseId ?? undefined;
   state._reasoningItemIdPolicy = stateJson.reasoningItemIdPolicy ?? undefined;
+  state._sessionHistoryMutations = (
+    stateJson.sessionHistoryMutations ?? []
+  ).map(snapshotExpectedSessionHistoryMutation);
 
   // rebuild tool use tracker
   state._toolUseTracker = new AgentToolUseTracker();
@@ -5572,7 +6338,7 @@ async function buildRunStateFromJson<TContext, TAgent extends Agent<any, any>>(
       schemaVersion,
     );
     if (
-      schemaVersion !== CURRENT_SCHEMA_VERSION &&
+      !schemaVersionSupportsV118State(schemaVersion) &&
       shouldRestoreSerializedContext
     ) {
       restoreLegacyHostedMcpApprovalsForPendingRequests(

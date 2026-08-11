@@ -13,10 +13,17 @@ export type SessionInputCallback = (
 export type SessionHistoryReplaceFunctionCallMutation = {
   type: 'replace_function_call';
   callId: string;
+  expected?: Extract<AgentInputItem, { type: 'function_call' }>;
   replacement: Extract<AgentInputItem, { type: 'function_call' }>;
 };
 
 export type SessionHistoryMutation = SessionHistoryReplaceFunctionCallMutation;
+
+/** @internal */
+export type SessionHistoryExpectedFunctionCallMutation =
+  SessionHistoryReplaceFunctionCallMutation & {
+    expected: Extract<AgentInputItem, { type: 'function_call' }>;
+  };
 
 export type SessionHistoryRewriteArgs = {
   mutations: SessionHistoryMutation[];
@@ -127,7 +134,10 @@ export interface RunContextAwareSession<TContext = unknown> extends Session {
 }
 
 export interface SessionHistoryRewriteAwareSession extends Session {
-  applyHistoryMutations(args: SessionHistoryRewriteArgs): Promise<void> | void;
+  applyHistoryMutations(
+    args: SessionHistoryRewriteArgs,
+    runContext?: RunContext<any>,
+  ): Promise<void> | void;
 }
 
 export type SessionHistoryAppendItemsTransaction = {

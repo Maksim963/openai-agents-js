@@ -124,6 +124,7 @@ describe('historical RunState compatibility corpus', () => {
       '1.14',
       '1.15',
       '1.17',
+      '1.18',
     ]);
     expect(
       manifest.schemas
@@ -134,7 +135,7 @@ describe('historical RunState compatibility corpus', () => {
       manifest.schemas
         .filter((entry) => entry.status === 'current_unreleased')
         .map((entry) => entry.schemaVersion),
-    ).toEqual(['1.18']);
+    ).toEqual(['1.19']);
   });
 
   it('pins every fixture to immutable bytes and complete writer provenance', () => {

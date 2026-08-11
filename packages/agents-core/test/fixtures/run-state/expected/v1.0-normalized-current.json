@@ -1,5 +1,5 @@
 {
-  "$schemaVersion": "1.18",
+  "$schemaVersion": "1.19",
   "currentTurn": 0,
   "currentAgent": {
     "name": "HistoricalAgent"
@@ -36,5 +36,6 @@
   "completedToolInvocations": [],
   "completedToolInvocationEvidence": [],
   "ambiguousToolInvocationCallIds": [],
+  "sessionHistoryMutations": [],
   "trace": null
 }

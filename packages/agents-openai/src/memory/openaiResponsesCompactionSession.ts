@@ -1,6 +1,7 @@
 import OpenAI from 'openai';
 import {
   getLogger,
+  isSessionHistoryRewriteAwareSession,
   MemorySession,
   RequestUsage,
   UserError,
@@ -10,6 +11,8 @@ import type {
   OpenAIResponsesCompactionArgs,
   OpenAIResponsesCompactionAwareSession as OpenAIResponsesCompactionSessionLike,
   Session,
+  SessionHistoryRewriteArgs,
+  SessionHistoryRewriteAwareSession,
 } from '@openai/agents-core';
 import type { OpenAIResponsesCompactionResult } from '@openai/agents-core';
 import { logModelAndToolActionWarning } from '@openai/agents-core/utils/internal';
@@ -110,6 +113,7 @@ export type OpenAIResponsesCompactionSessionOptions = {
 export class OpenAIResponsesCompactionSession
   implements
     OpenAIResponsesCompactionSessionLike,
+    SessionHistoryRewriteAwareSession,
     OpenAISessionApiTagged<'responses'>
 {
   readonly [OPENAI_SESSION_API] = 'responses' as const;
@@ -241,6 +245,16 @@ export class OpenAIResponsesCompactionSession
     return this.underlyingSession.getItems(limit);
   }
 
+  prepareHistoryItemsForPersistenceComparison(
+    items: AgentInputItem[],
+  ): AgentInputItem[] {
+    return (
+      this.underlyingSession.prepareHistoryItemsForPersistenceComparison?.(
+        items,
+      ) ?? items
+    );
+  }
+
   async addItems(items: AgentInputItem[]) {
     if (items.length === 0) {
       return;
@@ -300,6 +314,19 @@ export class OpenAIResponsesCompactionSession
       await this.underlyingSession.clearSession();
       this.compactionCandidateItems = [];
       this.sessionItems = [];
+    });
+  }
+
+  async applyHistoryMutations(args: SessionHistoryRewriteArgs): Promise<void> {
+    await this.runMutationOperation(async () => {
+      if (!isSessionHistoryRewriteAwareSession(this.underlyingSession)) {
+        throw new UserError(
+          'OpenAIResponsesCompactionSession requires its underlying session to support function-call history rewrites.',
+        );
+      }
+      await this.underlyingSession.applyHistoryMutations(args);
+      this.compactionCandidateItems = undefined;
+      this.sessionItems = undefined;
     });
   }
 

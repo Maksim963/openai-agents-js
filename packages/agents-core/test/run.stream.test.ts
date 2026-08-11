@@ -2993,18 +2993,25 @@ describe('Runner.run (streaming)', () => {
   });
 
   it('does not advance the turn for streaming runs resuming an interruption without persisted items', async () => {
+    const executedCities: string[] = [];
     const approvalTool = tool({
       name: 'get_weather',
       description: 'Gets weather for a city.',
       parameters: z.object({ city: z.string() }),
       needsApproval: async () => true,
-      execute: async ({ city }) => `Weather in ${city}`,
+      execute: async ({ city }) => {
+        executedCities.push(city);
+        return `Weather in ${city}`;
+      },
     });
 
     class ApprovalStreamingModel implements Model {
+      readonly requests: ModelRequest[] = [];
+
       constructor(private readonly responses: ModelResponse[]) {}
 
-      async getResponse(_req: ModelRequest): Promise<ModelResponse> {
+      async getResponse(req: ModelRequest): Promise<ModelResponse> {
+        this.requests.push(structuredClone(req));
         const response = this.responses.shift();
         if (!response) {
           throw new Error('No response found');
@@ -3050,9 +3057,10 @@ describe('Runner.run (streaming)', () => {
       { output: [fakeModelMessage('Stream done.')], usage: new Usage() },
     ];
 
+    const model = new ApprovalStreamingModel(modelResponses);
     const agent = new Agent({
       name: 'ApprovalStreamResume',
-      model: new ApprovalStreamingModel(modelResponses),
+      model,
       tools: [approvalTool],
       toolUseBehavior: 'run_llm_again',
     });
@@ -3071,7 +3079,9 @@ describe('Runner.run (streaming)', () => {
     expect(result.state._currentTurn).toBe(1);
     expect(result.state._currentTurnPersistedItemCount).toBe(0);
 
-    result.state.approve(result.interruptions[0]);
+    result.state.approve(result.interruptions[0], {
+      overrideArguments: { city: 'Portland' },
+    });
 
     result = await run(agent, result.state, { maxTurns: 1, stream: true });
 
@@ -3082,6 +3092,20 @@ describe('Runner.run (streaming)', () => {
 
     expect(result.finalOutput).toBe('Stream done.');
     expect(result.state._currentTurn).toBe(1);
+    expect(executedCities).toEqual(['Portland']);
+    expect(model.requests[1]?.input).toEqual([
+      expect.objectContaining({ role: 'user', content: 'Stream weather?' }),
+      expect.objectContaining({
+        type: 'function_call',
+        callId: 'call_weather_stream',
+        arguments: JSON.stringify({ city: 'Portland' }),
+      }),
+      expect.objectContaining({
+        type: 'function_call_result',
+        callId: 'call_weather_stream',
+        output: expect.objectContaining({ text: 'Weather in Portland' }),
+      }),
+    ]);
   });
 
   it('emits run item events in the order items are generated', async () => {
