@@ -1,11 +1,7 @@
 import { z } from 'zod';
 import { Agent } from '../src/agent';
-import {
-  Model,
-  ModelProvider,
-  ModelRequest,
-  ModelResponse,
-} from '../src/model';
+import { Model, ModelProvider, ModelResponse } from '../src/model';
+import { ScriptedModel, modelResponse } from '../src/testing';
 import { tool } from '../src/tool';
 import type { Computer } from '../src/computer';
 import type { Environment } from '../src/computer';
@@ -154,22 +150,9 @@ export class FakeComputer implements Computer {
   async wait(): Promise<void> {}
 }
 
-export class FakeModel implements Model {
-  constructor(private _responses: ModelResponse[] = []) {}
-
-  async getResponse(_request: ModelRequest): Promise<ModelResponse> {
-    const response = this._responses.shift();
-    if (!response) {
-      throw new Error('No response found');
-    }
-    return response;
-  }
-
-  /* eslint-disable require-yield */
-  async *getStreamedResponse(
-    _request: ModelRequest,
-  ): AsyncIterable<protocol.StreamEvent> {
-    throw new Error('Not implemented');
+export class FakeModel extends ScriptedModel {
+  constructor(responses: ModelResponse[] = []) {
+    super(responses.map(modelResponse));
   }
 }
 

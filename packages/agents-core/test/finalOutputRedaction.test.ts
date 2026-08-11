@@ -10,11 +10,9 @@ import {
   setTracingDisabled,
   type AgentInputItem,
   type Model,
-  type ModelRequest,
   type ModelResponse,
   type ReasoningItem,
   type Session,
-  type StreamEvent,
 } from '../src';
 import { defineOutputGuardrail } from '../src/guardrail';
 import logger from '../src/logger';
@@ -29,6 +27,7 @@ import {
   fakeModelMessage,
   fakeModelRefusal,
 } from './stubs';
+import { ScriptedModel, modelResponder } from '../src/testing';
 
 const MODEL_OUTPUT_SECRET = 'SECRET_STRUCTURED_FINAL_OUTPUT_4207';
 const MISSING_OUTPUT_SECRET = 'SECRET_MISSING_STRUCTURED_OUTPUT_4208';
@@ -68,24 +67,15 @@ function responseWithMissingOutput(): ModelResponse {
   };
 }
 
-class StreamingModel implements Model {
-  constructor(private readonly response: ModelResponse) {}
-
-  async getResponse(_request: ModelRequest): Promise<ModelResponse> {
-    throw new Error('Use getStreamedResponse for this model.');
-  }
-
-  async *getStreamedResponse(
-    _request: ModelRequest,
-  ): AsyncIterable<StreamEvent> {
-    yield {
-      type: 'response_done',
-      response: {
-        id: 'redacted-final-output-response',
-        output: this.response.output,
-        usage: this.response.usage,
-      },
-    } as StreamEvent;
+class StreamingModel extends ScriptedModel {
+  constructor(response: ModelResponse) {
+    super([
+      modelResponder((call) =>
+        call.streamed
+          ? { ...response, responseId: 'redacted-final-output-response' }
+          : response,
+      ),
+    ]);
   }
 }
 

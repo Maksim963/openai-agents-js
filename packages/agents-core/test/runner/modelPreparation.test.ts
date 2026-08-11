@@ -35,32 +35,8 @@ import {
 } from '../stubs';
 
 class RecordingModel extends FakeModel {
-  readonly requests: ModelRequest[] = [];
-
-  override async getResponse(request: ModelRequest) {
-    this.requests.push(request);
-    return super.getResponse(request);
-  }
-
-  override async *getStreamedResponse(
-    request: ModelRequest,
-  ): AsyncIterable<protocol.StreamEvent> {
-    const response = await this.getResponse(request);
-    yield {
-      type: 'response_done',
-      response: {
-        id: response.responseId ?? 'recording-response',
-        usage: {
-          requests: response.usage.requests,
-          inputTokens: response.usage.inputTokens,
-          outputTokens: response.usage.outputTokens,
-          totalTokens: response.usage.totalTokens,
-        },
-        output: response.output.map((item) =>
-          protocol.OutputModelItem.parse(item),
-        ),
-      },
-    };
+  get requests(): readonly Readonly<ModelRequest>[] {
+    return this.calls.map((call) => call.request);
   }
 }
 

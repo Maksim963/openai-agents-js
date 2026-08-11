@@ -3,7 +3,7 @@ import { z } from 'zod';
 
 import { Agent } from '../src/agent';
 import { RunToolCallOutputItem } from '../src/items';
-import type { ModelRequest, ModelResponse } from '../src/model';
+import type { ModelRequest } from '../src/model';
 import type { MCPServer, MCPTool } from '../src/mcp';
 import { mcpToFunctionTool } from '../src/mcp';
 import { run, Runner } from '../src/run';
@@ -20,11 +20,8 @@ import { Usage } from '../src/usage';
 import { FakeComputer, FakeEditor, FakeModel, fakeModelMessage } from './stubs';
 
 class RecordingModel extends FakeModel {
-  readonly requests: ModelRequest[] = [];
-
-  async getResponse(request: ModelRequest): Promise<ModelResponse> {
-    this.requests.push(request);
-    return super.getResponse(request);
+  get requests(): readonly Readonly<ModelRequest>[] {
+    return this.calls.map((call) => call.request);
   }
 }
 

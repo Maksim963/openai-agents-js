@@ -5,10 +5,7 @@ import {
   Agent,
   type AgentInputItem,
   MemorySession,
-  type Model,
   type ModelRequest,
-  type ModelResponse,
-  type ResponseStreamEvent,
   Usage,
   protocol,
   run,
@@ -16,6 +13,7 @@ import {
   tool,
 } from '../src';
 import { FakeModelProvider } from './stubs';
+import { ScriptedModel, modelResponder } from '../src/testing';
 
 const TOOL_ECHO = 'approved_echo';
 const TOOL_NOTE = 'approved_note';
@@ -60,38 +58,31 @@ type ScenarioStep = {
   expectedOutput: string;
 };
 
-class ScenarioModel implements Model {
-  #counter = 0;
+function createScenarioModel(): ScriptedModel {
+  return new ScriptedModel(
+    USER_MESSAGES.map(() =>
+      modelResponder((call) => {
+        const request = call.request;
+        const toolName =
+          typeof request.modelSettings.toolChoice === 'string'
+            ? request.modelSettings.toolChoice
+            : TOOL_ECHO;
+        const callId = `call_${call.index}`;
+        const query = extractUserMessage(request.input);
+        const toolCall: protocol.FunctionCallItem = {
+          id: `fc_${callId}`,
+          type: 'function_call',
+          name: toolName,
+          callId,
+          status: 'completed',
+          arguments: JSON.stringify({ query }),
+          providerData: {},
+        };
 
-  async getResponse(request: ModelRequest): Promise<ModelResponse> {
-    const toolName =
-      typeof request.modelSettings.toolChoice === 'string'
-        ? request.modelSettings.toolChoice
-        : TOOL_ECHO;
-    const callId = `call_${(this.#counter += 1)}`;
-    const query = extractUserMessage(request.input);
-    const toolCall: protocol.FunctionCallItem = {
-      id: `fc_${callId}`,
-      type: 'function_call',
-      name: toolName,
-      callId,
-      status: 'completed',
-      arguments: JSON.stringify({ query }),
-      providerData: {},
-    };
-
-    return {
-      usage: new Usage(),
-      output: [toolCall],
-    };
-  }
-
-  // eslint-disable-next-line require-yield -- this scenario does not stream.
-  async *getStreamedResponse(
-    _request: ModelRequest,
-  ): AsyncIterable<ResponseStreamEvent> {
-    throw new Error('Streaming is not supported in this scenario.');
-  }
+        return { usage: new Usage(), output: [toolCall] };
+      }),
+    ),
+  );
 }
 
 describe('MemorySession HITL scenario', () => {
@@ -103,7 +94,7 @@ describe('MemorySession HITL scenario', () => {
     executeCounts.clear();
     const session = new MemorySession();
     const sessionId = await session.getSessionId();
-    const model = new ScenarioModel();
+    const model = createScenarioModel();
 
     const steps: ScenarioStep[] = [
       {
@@ -155,7 +146,7 @@ describe('MemorySession HITL scenario', () => {
 
 async function runScenarioStep(
   session: MemorySession,
-  model: ScenarioModel,
+  model: ScriptedModel,
   step: ScenarioStep,
 ): Promise<{
   approvalItem: protocol.FunctionCallItem;

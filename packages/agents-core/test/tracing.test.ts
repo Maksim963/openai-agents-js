@@ -75,7 +75,6 @@ import { RunContext } from '../src/runContext';
 import { RunState } from '../src/runState';
 import { FakeModel, fakeModelMessage, FakeModelProvider } from './stubs';
 import { Usage } from '../src/usage';
-import * as protocol from '../src/types/protocol';
 import { setDefaultModelProvider } from '../src/providers';
 import { AsyncLocalStorage as BrowserAsyncLocalStorage } from '../src/shims/shims-browser';
 import { supportsProcessLifecycleEvents as workerdSupportsProcessLifecycleEvents } from '../src/shims/shims-workerd';
@@ -1567,34 +1566,13 @@ describe('withTrace & span helpers (integration)', () => {
     const orderProcessor = new OrderTrackingProcessor();
     setTraceProcessors([orderProcessor]);
 
-    // Create a fake model that supports streaming
-    class StreamingFakeModel extends FakeModel {
-      async *getStreamedResponse(
-        _request: any,
-      ): AsyncIterable<protocol.StreamEvent> {
-        const response = await this.getResponse(_request);
-        yield {
-          type: 'response_done',
-          response: {
-            id: 'resp-1',
-            usage: {
-              requests: 1,
-              inputTokens: 0,
-              outputTokens: 0,
-              totalTokens: 0,
-            },
-            output: response.output,
-          },
-        } as any;
-      }
-    }
-
     const agent = new Agent({
       name: 'TestAgent',
-      model: new StreamingFakeModel([
+      model: new FakeModel([
         {
           output: [fakeModelMessage('Final output')],
           usage: new Usage(),
+          responseId: 'resp-1',
         },
       ]),
     });

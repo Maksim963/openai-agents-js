@@ -80,13 +80,8 @@ class MemoryPhaseModelProvider implements ModelProvider {
 }
 
 class RecordingFakeModel extends FakeModel {
-  readonly requests: Parameters<Model['getResponse']>[0][] = [];
-
-  override async getResponse(
-    request: Parameters<Model['getResponse']>[0],
-  ): ReturnType<Model['getResponse']> {
-    this.requests.push(request);
-    return await super.getResponse(request);
+  get requests(): readonly Readonly<Parameters<Model['getResponse']>[0]>[] {
+    return this.calls.map((call) => call.request);
   }
 }
 

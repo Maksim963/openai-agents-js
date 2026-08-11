@@ -107,6 +107,7 @@ import {
   fakeModelMessage,
 } from './stubs';
 import { AsyncLocalStorage as BrowserAsyncLocalStorage } from '../src/shims/shims-browser';
+import { ScriptedModel, modelResponder } from '../src/testing';
 
 class StubEditor implements Editor {
   async createFile(
@@ -129,44 +130,25 @@ class StubEditor implements Editor {
 }
 
 class RecordingFakeModel extends FakeModel {
-  public readonly requests: ModelRequest[] = [];
-
-  override async getResponse(request: ModelRequest) {
-    this.requests.push(request);
-    return await super.getResponse(request);
+  get requests(): readonly Readonly<ModelRequest>[] {
+    return this.calls.map((call) => call.request);
   }
 }
 
-class RecordingStreamingModel implements Model {
-  public readonly requests: ModelRequest[] = [];
-
-  constructor(private readonly responses: ModelResponse[]) {}
-
-  async getResponse(_request: ModelRequest): Promise<ModelResponse> {
-    throw new Error('Use getStreamedResponse for this test model.');
+class RecordingStreamingModel extends ScriptedModel {
+  constructor(responses: ModelResponse[]) {
+    super(
+      responses.map((response) =>
+        modelResponder((call) => ({
+          ...response,
+          responseId: `stream-${call.index}`,
+        })),
+      ),
+    );
   }
 
-  async *getStreamedResponse(
-    request: ModelRequest,
-  ): AsyncIterable<protocol.StreamEvent> {
-    this.requests.push(request);
-    const response = this.responses.shift();
-    if (!response) {
-      throw new Error('No response found');
-    }
-    yield {
-      type: 'response_done',
-      response: {
-        id: `stream-${this.requests.length}`,
-        usage: {
-          requests: 1,
-          inputTokens: 0,
-          outputTokens: 0,
-          totalTokens: 0,
-        },
-        output: response.output,
-      },
-    } as protocol.StreamEvent;
+  get requests(): readonly Readonly<ModelRequest>[] {
+    return this.calls.map((call) => call.request);
   }
 }
 
@@ -5444,22 +5426,19 @@ describe('sandbox runner integration', () => {
 
   it('rejects concurrent reuse of the same SandboxAgent across runs', async () => {
     let releaseFirstRun: (() => void) | undefined;
-    const blockingModel = {
-      async getResponse(request: ModelRequest) {
+    const blockingModel = new ScriptedModel([
+      modelResponder(async (call) => {
         await new Promise<void>((resolve) => {
           releaseFirstRun = resolve;
         });
         return {
           output: [
-            fakeModelMessage(String(request.systemInstructions ?? 'done')),
+            fakeModelMessage(String(call.request.systemInstructions ?? 'done')),
           ],
           usage: new Usage(),
         };
-      },
-      async *getStreamedResponse() {
-        yield* [];
-      },
-    };
+      }),
+    ]);
     const sandboxAgent = new SandboxAgent({
       name: 'SandboxWorker',
       model: blockingModel,

@@ -26,8 +26,6 @@ import {
   withGenerationSpan,
   withTrace,
   withTraceContext,
-  type Model,
-  type ModelRequest,
   type ModelResponse,
   type MCPServer,
   type OpenAIResponsesCompactionResult,
@@ -41,6 +39,14 @@ import { SandboxRuntimeManager } from '../src/sandbox/runtime';
 import { AsyncLocalStorage as BrowserAsyncLocalStorage } from '../src/shims/shims-browser';
 import { fakeModelMessage, FakeModel } from './stubs';
 import logger from '../src/logger';
+import {
+  ScriptedModel,
+  modelError,
+  modelResponder,
+  modelResponse,
+  modelStreamResponder,
+  type RecordedModelCall,
+} from '../src/testing';
 
 class RecordingProcessor implements TracingProcessor {
   readonly spansStarted: Span<any>[] = [];
@@ -60,102 +66,82 @@ class RecordingProcessor implements TracingProcessor {
   async forceFlush(): Promise<void> {}
 }
 
-class StreamingModel implements Model {
-  private readonly responses: ModelResponse[];
-
+class StreamingModel extends ScriptedModel {
   constructor(response: ModelResponse | ModelResponse[]) {
-    this.responses = Array.isArray(response) ? [...response] : [response];
-  }
-
-  async getResponse(_request: ModelRequest): Promise<ModelResponse> {
-    throw new Error('Use getStreamedResponse for this model.');
-  }
-
-  async *getStreamedResponse(
-    _request: ModelRequest,
-  ): AsyncIterable<StreamEvent> {
-    const response = this.responses.shift();
-    if (!response) {
-      throw new Error('No response found.');
-    }
-    yield {
-      type: 'response_done',
-      response: {
-        id: 'stream-response',
-        output: response.output,
-        usage: response.usage,
-      },
-    } as StreamEvent;
+    const responses = Array.isArray(response) ? response : [response];
+    super(
+      responses.map((item) =>
+        modelResponder((call) =>
+          call.streamed ? { ...item, responseId: 'stream-response' } : item,
+        ),
+      ),
+    );
   }
 }
 
-class FailingModel implements Model {
-  constructor(private readonly error: Error) {}
-
-  async getResponse(): Promise<ModelResponse> {
-    throw this.error;
-  }
-
-  async *getStreamedResponse(): AsyncIterable<StreamEvent> {
-    throw this.error;
-    yield* [] as StreamEvent[];
+class FailingModel extends ScriptedModel {
+  constructor(error: Error) {
+    super([modelError(error)]);
   }
 }
 
-class HangingStreamingModel implements Model {
-  async getResponse(): Promise<ModelResponse> {
-    throw new Error('Use getStreamedResponse for this model.');
-  }
-
-  async *getStreamedResponse(
-    request: ModelRequest,
-  ): AsyncIterable<StreamEvent> {
-    const abortError = new Error('aborted');
-    abortError.name = 'AbortError';
-    const signal = request.signal;
-    await new Promise((_resolve, reject) => {
-      if (signal?.aborted) {
-        reject(abortError);
-        return;
-      }
-      signal?.addEventListener('abort', () => reject(abortError), {
-        once: true,
-      });
-    });
-    yield* [] as StreamEvent[];
+class HangingStreamingModel extends ScriptedModel {
+  constructor() {
+    super([
+      modelStreamResponder((call) =>
+        (async function* () {
+          const abortError = new Error('aborted');
+          abortError.name = 'AbortError';
+          const signal = call.request.signal;
+          await new Promise((_resolve, reject) => {
+            if (signal?.aborted) {
+              reject(abortError);
+              return;
+            }
+            signal?.addEventListener('abort', () => reject(abortError), {
+              once: true,
+            });
+          });
+          yield* [] as StreamEvent[];
+        })(),
+      ),
+    ]);
   }
 }
 
-class AbortReconciliationUsageModel implements Model {
-  async getResponse(): Promise<ModelResponse> {
-    return responseWithSpecificUsage(7, 3);
-  }
-
-  async *getStreamedResponse(): AsyncIterable<StreamEvent> {
-    yield {
-      type: 'model',
-      event: {
-        type: 'response.created',
-        response: { id: 'response-before-abort' },
-      },
-    } as StreamEvent;
-    yield {
-      type: 'model',
-      event: {
-        type: 'response.output_item.done',
-        item: {
-          type: 'function_call',
-          id: 'function-call-before-abort',
-          call_id: 'call-before-abort',
-          name: 'slow_tool',
-          arguments: '{}',
-          status: 'completed',
-        },
-      },
-    } as StreamEvent;
-    const abortError = new Error('aborted');
-    abortError.name = 'AbortError';
-    throw abortError;
+class AbortReconciliationUsageModel extends ScriptedModel {
+  constructor() {
+    super([
+      modelStreamResponder(() =>
+        (async function* () {
+          yield {
+            type: 'model',
+            event: {
+              type: 'response.created',
+              response: { id: 'response-before-abort' },
+            },
+          } as StreamEvent;
+          yield {
+            type: 'model',
+            event: {
+              type: 'response.output_item.done',
+              item: {
+                type: 'function_call',
+                id: 'function-call-before-abort',
+                call_id: 'call-before-abort',
+                name: 'slow_tool',
+                arguments: '{}',
+                status: 'completed',
+              },
+            },
+          } as StreamEvent;
+          const abortError = new Error('aborted');
+          abortError.name = 'AbortError';
+          throw abortError;
+        })(),
+      ),
+      modelResponse(responseWithSpecificUsage(7, 3)),
+    ]);
   }
 }
 
@@ -208,113 +194,91 @@ function createBarrier(participantCount: number) {
   };
 }
 
-class CoordinatedModel implements Model {
-  private readonly responses: ModelResponse[];
-  private callCount = 0;
-
+class CoordinatedModel extends ScriptedModel {
   constructor(
     response: ModelResponse | ModelResponse[],
-    private readonly waitForPeers: () => Promise<void>,
-    private readonly waitBeforeResponse?: Promise<void>,
+    waitForPeers: () => Promise<void>,
+    waitBeforeResponse?: Promise<void>,
   ) {
-    this.responses = Array.isArray(response) ? [...response] : [response];
-  }
-
-  async getResponse(_request: ModelRequest): Promise<ModelResponse> {
-    if (this.callCount === 0) {
-      await this.waitForPeers();
-      await this.waitBeforeResponse;
-    }
-    this.callCount += 1;
-    const response = this.responses.shift();
-    if (!response) {
-      throw new Error('No coordinated response found.');
-    }
-    return response;
-  }
-
-  getStreamedResponse(_request: ModelRequest): AsyncIterable<StreamEvent> {
-    throw new Error('Streaming is not supported by this model.');
+    const responses = Array.isArray(response) ? response : [response];
+    super(
+      responses.map((item, index) =>
+        index === 0
+          ? modelResponder(async () => {
+              await waitForPeers();
+              await waitBeforeResponse;
+              return item;
+            })
+          : modelResponse(item),
+      ),
+    );
   }
 }
 
-class CoordinatedTracingModel implements Model {
-  constructor(
-    private readonly label: string,
-    private readonly waitForPeers: () => Promise<void>,
-  ) {}
-
-  async getResponse(request: ModelRequest): Promise<ModelResponse> {
-    return withGenerationSpan(
-      async () => {
-        await this.waitForPeers();
-        return responseWithoutUsage();
-      },
-      { data: { model: this.label } },
-      request._internal?.tracingParent,
-    );
-  }
-
-  getStreamedResponse(_request: ModelRequest): AsyncIterable<StreamEvent> {
-    throw new Error('Streaming is not supported by this model.');
+class CoordinatedTracingModel extends ScriptedModel {
+  constructor(label: string, waitForPeers: () => Promise<void>) {
+    super([
+      modelResponder((call) =>
+        withGenerationSpan(
+          async () => {
+            await waitForPeers();
+            return responseWithoutUsage();
+          },
+          { data: { model: label } },
+          call.request._internal?.tracingParent,
+        ),
+      ),
+    ]);
   }
 }
 
-class RetryingTracingModel implements Model {
-  private attempts = 0;
-
-  async getResponse(request: ModelRequest): Promise<ModelResponse> {
-    return withGenerationSpan(
-      async () => {
-        this.attempts += 1;
-        if (this.attempts === 1) {
-          const error = new Error('Rate limited');
-          (error as Error & { statusCode?: number }).statusCode = 429;
-          throw error;
-        }
-        return responseWithSpecificUsage(7, 3);
-      },
-      { data: { model: `retry-attempt-${this.attempts + 1}` } },
-      request._internal?.tracingParent,
-    );
-  }
-
-  getStreamedResponse(_request: ModelRequest): AsyncIterable<StreamEvent> {
-    throw new Error('Streaming is not supported by this model.');
-  }
-}
-
-class CoordinatedStreamingTracingModel implements Model {
-  constructor(
-    private readonly label: string,
-    private readonly waitForPeers: () => Promise<void>,
-  ) {}
-
-  async getResponse(): Promise<ModelResponse> {
-    throw new Error('Use getStreamedResponse for this model.');
-  }
-
-  async *getStreamedResponse(
-    request: ModelRequest,
-  ): AsyncIterable<StreamEvent> {
-    const span = createGenerationSpan(
-      { data: { model: this.label } },
-      request._internal?.tracingParent,
-    );
-    span.start();
-    try {
-      await this.waitForPeers();
-      yield {
-        type: 'response_done',
-        response: {
-          id: `stream-response-${this.label}`,
-          output: responseWithoutUsage().output,
-          usage: new Usage(),
+class RetryingTracingModel extends ScriptedModel {
+  constructor() {
+    let attempts = 0;
+    const respond = (call: RecordedModelCall) =>
+      withGenerationSpan(
+        async () => {
+          attempts += 1;
+          if (attempts === 1) {
+            const error = new Error('Rate limited');
+            (error as Error & { statusCode?: number }).statusCode = 429;
+            throw error;
+          }
+          return responseWithSpecificUsage(7, 3);
         },
-      } as StreamEvent;
-    } finally {
-      span.end();
-    }
+        { data: { model: `retry-attempt-${attempts + 1}` } },
+        call.request._internal?.tracingParent,
+      );
+    super([modelResponder(respond), modelResponder(respond)]);
+  }
+}
+
+class CoordinatedStreamingTracingModel extends ScriptedModel {
+  constructor(label: string, waitForPeers: () => Promise<void>) {
+    super([
+      modelStreamResponder((call) =>
+        (async function* () {
+          const span = createGenerationSpan(
+            { data: { model: label } },
+            call.request._internal?.tracingParent,
+          );
+          span.start();
+          try {
+            await waitForPeers();
+            yield {
+              type: 'response_done',
+              response: {
+                id: `stream-response-${label}`,
+                output: responseWithoutUsage().output,
+                usage: new Usage(),
+              },
+            } as StreamEvent;
+          } finally {
+            span.end();
+          }
+        })(),
+      ),
+    ]);
   }
 }
 

@@ -90,6 +90,12 @@ import {
   ModelRequest,
   ModelSettings,
 } from '../src/model';
+import {
+  ScriptedModel,
+  modelError,
+  modelResponder,
+  modelResponse,
+} from '../src/testing';
 
 const PROGRAMMATIC_TOOL_CALLING_TOOL: HostedTool = {
   type: 'hosted_tool',
@@ -113,6 +119,47 @@ function getFirstTextContent(item: AgentInputItem): string | undefined {
 
 function getRequestInputItems(request: ModelRequest): AgentInputItem[] {
   return Array.isArray(request.input) ? request.input : [];
+}
+
+function cloneModelRequest(request: Readonly<ModelRequest>): ModelRequest {
+  return {
+    ...request,
+    input: Array.isArray(request.input)
+      ? (JSON.parse(JSON.stringify(request.input)) as AgentInputItem[])
+      : request.input,
+  };
+}
+
+function createReasoningPolicyModel(options: {
+  reasoningId: string;
+  functionId: string;
+  callId: string;
+  toolName: string;
+}): ScriptedModel {
+  return new ScriptedModel([
+    modelResponse({
+      output: [
+        {
+          type: 'reasoning',
+          id: options.reasoningId,
+          content: [{ type: 'input_text', text: 'reasoning trace' }],
+        } satisfies protocol.ReasoningItem,
+        {
+          type: 'function_call',
+          id: options.functionId,
+          callId: options.callId,
+          name: options.toolName,
+          status: 'completed',
+          arguments: '{}',
+        } satisfies protocol.FunctionCallItem,
+      ],
+      usage: new Usage(),
+    }),
+    modelResponse({
+      output: [fakeModelMessage('done')],
+      usage: new Usage(),
+    }),
+  ]);
 }
 
 describe('Runner.run', () => {
@@ -1745,11 +1792,8 @@ describe('Runner.run', () => {
 
     it('returns missing function tool errors to the model when opted in', async () => {
       class RecordingModel extends FakeModel {
-        readonly requests: ModelRequest[] = [];
-
-        async getResponse(request: ModelRequest): Promise<ModelResponse> {
-          this.requests.push(request);
-          return super.getResponse(request);
+        get requests(): readonly Readonly<ModelRequest>[] {
+          return this.calls.map((call) => call.request);
         }
       }
 
@@ -1800,11 +1844,8 @@ describe('Runner.run', () => {
 
     it('uses toolErrorFormatter for missing function tool errors', async () => {
       class RecordingModel extends FakeModel {
-        readonly requests: ModelRequest[] = [];
-
-        async getResponse(request: ModelRequest): Promise<ModelResponse> {
-          this.requests.push(request);
-          return super.getResponse(request);
+        get requests(): readonly Readonly<ModelRequest>[] {
+          return this.calls.map((call) => call.request);
         }
       }
 
@@ -1860,11 +1901,8 @@ describe('Runner.run', () => {
 
     it('redacts hostile tool-not-found formatter errors and keeps the fallback result', async () => {
       class RecordingModel extends FakeModel {
-        readonly requests: ModelRequest[] = [];
-
-        async getResponse(request: ModelRequest): Promise<ModelResponse> {
-          this.requests.push(request);
-          return super.getResponse(request);
+        get requests(): readonly Readonly<ModelRequest>[] {
+          return this.calls.map((call) => call.request);
         }
       }
 
@@ -2034,13 +2072,9 @@ describe('Runner.run', () => {
     });
 
     it('rejects custom client tool_search parameters without execute before calling the model', async () => {
-      const getResponse = vi.fn().mockResolvedValue(TEST_MODEL_RESPONSE_BASIC);
-      const model: Model = {
-        getResponse,
-        async *getStreamedResponse() {
-          yield* [];
-        },
-      };
+      const model = new ScriptedModel([
+        modelResponse(TEST_MODEL_RESPONSE_BASIC),
+      ]);
       const agent = new Agent({
         name: 'ClientToolSearchValidationAgent',
         model,
@@ -2073,7 +2107,7 @@ describe('Runner.run', () => {
       await expect(runPromise).rejects.toThrow(
         /require toolSearchTool\(\{ execution: "client", execute \}\)/,
       );
-      expect(getResponse).not.toHaveBeenCalled();
+      expect(model.calls).toHaveLength(0);
     });
 
     it('loads runtime tools from custom client tool_search execute callbacks across turns', async () => {
@@ -2553,16 +2587,10 @@ describe('Runner.run', () => {
     });
 
     it('applies toolChoice updates from agent_tool_end before the next model call', async () => {
-      class ToolChoiceTrackingModel implements Model {
-        requests: ModelRequest[] = [];
-        private callCount = 0;
-
-        async getResponse(request: ModelRequest): Promise<ModelResponse> {
-          this.requests.push(request);
-          this.callCount += 1;
-
-          if (this.callCount === 1) {
-            return {
+      class ToolChoiceTrackingModel extends ScriptedModel {
+        constructor() {
+          super([
+            modelResponse({
               output: [
                 {
                   ...TEST_MODEL_FUNCTION_CALL,
@@ -2573,20 +2601,16 @@ describe('Runner.run', () => {
                 },
               ],
               usage: new Usage(),
-            };
-          }
-
-          return {
-            output: [fakeModelMessage('finished')],
-            usage: new Usage(),
-          };
+            }),
+            modelResponse({
+              output: [fakeModelMessage('finished')],
+              usage: new Usage(),
+            }),
+          ]);
         }
 
-        async *getStreamedResponse(
-          _request: ModelRequest,
-        ): AsyncIterable<protocol.StreamEvent> {
-          yield* [];
-          throw new Error('Not implemented');
+        get requests(): readonly ModelRequest[] {
+          return this.calls.map((call) => call.request);
         }
       }
 
@@ -2611,13 +2635,10 @@ describe('Runner.run', () => {
     });
 
     it('continues Programmatic Tool Calling through nested calls and program output', async () => {
-      class ProgrammaticToolCallingModel implements Model {
-        requests: ModelRequest[] = [];
-
-        async getResponse(request: ModelRequest): Promise<ModelResponse> {
-          this.requests.push(request);
-          if (this.requests.length === 1) {
-            return {
+      class ProgrammaticToolCallingModel extends ScriptedModel {
+        constructor() {
+          super([
+            modelResponse({
               output: [
                 {
                   type: 'program',
@@ -2644,10 +2665,8 @@ describe('Runner.run', () => {
                 },
               ],
               usage: new Usage(),
-            };
-          }
-          if (this.requests.length === 2) {
-            return {
+            }),
+            modelResponse({
               output: [
                 {
                   type: 'program_output',
@@ -2658,17 +2677,16 @@ describe('Runner.run', () => {
                 },
               ],
               usage: new Usage(),
-            };
-          }
-          return {
-            output: [fakeModelMessage('Program completed.')],
-            usage: new Usage(),
-          };
+            }),
+            modelResponse({
+              output: [fakeModelMessage('Program completed.')],
+              usage: new Usage(),
+            }),
+          ]);
         }
 
-        async *getStreamedResponse(): AsyncIterable<protocol.StreamEvent> {
-          yield* [];
-          throw new Error('Not implemented');
+        get requests(): readonly ModelRequest[] {
+          return this.calls.map((call) => call.request);
         }
       }
 
@@ -2949,26 +2967,31 @@ describe('Runner.run', () => {
     });
 
     it('propagates model errors', async () => {
-      const agent = new Agent({ name: 'Fail', model: new FakeModel() });
+      const agent = new Agent({
+        name: 'Fail',
+        model: new ScriptedModel([
+          modelError(new Error('Scripted model failure')),
+        ]),
+      });
 
-      await expect(run(agent, 'fail')).rejects.toThrow('No response found');
+      await expect(run(agent, 'fail')).rejects.toThrow(
+        'Scripted model failure',
+      );
     });
 
     it('sets overridePromptModel when agent supplies a prompt and explicit model', async () => {
-      class CapturingModel implements Model {
-        lastRequest?: ModelRequest;
-        async getResponse(request: ModelRequest): Promise<ModelResponse> {
-          this.lastRequest = request;
-          return {
-            output: [fakeModelMessage('override')],
-            usage: new Usage(),
-          };
+      class CapturingModel extends ScriptedModel {
+        constructor() {
+          super([
+            modelResponse({
+              output: [fakeModelMessage('override')],
+              usage: new Usage(),
+            }),
+          ]);
         }
-        async *getStreamedResponse(
-          _request: ModelRequest,
-        ): AsyncIterable<protocol.StreamEvent> {
-          yield* [];
-          throw new Error('Not implemented');
+
+        get lastRequest(): Readonly<ModelRequest> | undefined {
+          return this.lastCall?.request;
         }
       }
 
@@ -2988,22 +3011,18 @@ describe('Runner.run', () => {
     });
 
     it('serializes GA computer tools without requiring display metadata', async () => {
-      class CapturingModel implements Model {
-        lastRequest?: ModelRequest;
-
-        async getResponse(request: ModelRequest): Promise<ModelResponse> {
-          this.lastRequest = request;
-          return {
-            output: [fakeModelMessage('computer ok')],
-            usage: new Usage(),
-          };
+      class CapturingModel extends ScriptedModel {
+        constructor() {
+          super([
+            modelResponse({
+              output: [fakeModelMessage('computer ok')],
+              usage: new Usage(),
+            }),
+          ]);
         }
 
-        async *getStreamedResponse(
-          _request: ModelRequest,
-        ): AsyncIterable<protocol.StreamEvent> {
-          yield* [];
-          throw new Error('Not implemented');
+        get lastRequest(): Readonly<ModelRequest> | undefined {
+          return this.lastCall?.request;
         }
       }
 
@@ -3316,26 +3335,17 @@ describe('Runner.run', () => {
   });
 
   describe('additional scenarios', () => {
-    class StreamingModel extends FakeModel {
+    class StreamingModel extends ScriptedModel {
       constructor(resp: protocol.AssistantMessageItem) {
-        super([{ output: [resp], usage: new Usage() }]);
-        this._resp = resp;
-      }
-      private _resp: protocol.AssistantMessageItem;
-      override async *getStreamedResponse(): AsyncIterable<protocol.StreamEvent> {
-        yield {
-          type: 'output_text_delta',
-          delta: 'hi',
-          providerData: {},
-        } as any;
-        yield {
-          type: 'response_done',
-          response: {
-            id: 'r1',
-            usage: { inputTokens: 0, outputTokens: 0, totalTokens: 0 },
-            output: [this._resp],
-          },
-        } as any;
+        super(
+          Array.from({ length: 3 }, (_, index) =>
+            modelResponse({
+              output: [resp],
+              usage: new Usage(),
+              responseId: `r${index + 1}`,
+            }),
+          ),
+        );
       }
     }
 
@@ -3516,23 +3526,18 @@ describe('Runner.run', () => {
         }),
       };
 
-      class ExpectGuardrailFirstModel implements Model {
-        calls = 0;
-
-        async getResponse(_request: ModelRequest): Promise<ModelResponse> {
-          this.calls++;
-          expect(guardrailCompleted).toBe(true);
-          return {
-            output: [fakeModelMessage('done')],
-            usage: new Usage(),
-          };
+      class ExpectGuardrailFirstModel extends ScriptedModel {
+        constructor() {
+          super([
+            modelResponder(() => {
+              expect(guardrailCompleted).toBe(true);
+              return {
+                output: [fakeModelMessage('done')],
+                usage: new Usage(),
+              };
+            }),
+          ]);
         }
-
-        /* eslint-disable require-yield */
-        async *getStreamedResponse(_request: ModelRequest) {
-          throw new Error('not implemented');
-        }
-        /* eslint-enable require-yield */
       }
 
       const agent = new Agent({
@@ -3577,22 +3582,15 @@ describe('Runner.run', () => {
         },
       };
 
-      class TrackingModel implements Model {
-        calls = 0;
-
-        async getResponse(_request: ModelRequest): Promise<ModelResponse> {
-          this.calls++;
-          return {
-            output: [fakeModelMessage('should not run')],
-            usage: new Usage(),
-          };
+      class TrackingModel extends ScriptedModel {
+        constructor() {
+          super([
+            modelResponse({
+              output: [fakeModelMessage('should not run')],
+              usage: new Usage(),
+            }),
+          ]);
         }
-
-        /* eslint-disable require-yield */
-        async *getStreamedResponse(_request: ModelRequest) {
-          throw new Error('not implemented');
-        }
-        /* eslint-enable require-yield */
       }
 
       const model = new TrackingModel();
@@ -3614,14 +3612,14 @@ describe('Runner.run', () => {
       );
       await errorThrown;
       await new Promise((resolve) => setTimeout(resolve, 0));
-      const callsBeforeSiblingFinished = model.calls;
+      const callsBeforeSiblingFinished = model.calls.length;
       const settledBeforeSiblingFinished = runSettled;
       releaseSlowGuardrail();
 
       await expect(runPromise).rejects.toBeInstanceOf(GuardrailExecutionError);
       expect(callsBeforeSiblingFinished).toBe(0);
       expect(settledBeforeSiblingFinished).toBe(false);
-      expect(model.calls).toBe(0);
+      expect(model.calls).toHaveLength(0);
     });
 
     it('retains an admitted turn when a parallel guardrail fails after the model starts', async () => {
@@ -3642,24 +3640,19 @@ describe('Runner.run', () => {
         },
       };
 
-      class TrackingModel implements Model {
-        calls = 0;
-
-        async getResponse(_request: ModelRequest): Promise<ModelResponse> {
-          this.calls++;
-          markModelStarted();
-          await guardrailFailing;
-          return {
-            output: [fakeModelMessage('unused')],
-            usage: new Usage(),
-          };
+      class TrackingModel extends ScriptedModel {
+        constructor() {
+          super([
+            modelResponder(async () => {
+              markModelStarted();
+              await guardrailFailing;
+              return {
+                output: [fakeModelMessage('unused')],
+                usage: new Usage(),
+              };
+            }),
+          ]);
         }
-
-        /* eslint-disable require-yield */
-        async *getStreamedResponse(_request: ModelRequest) {
-          throw new Error('not implemented');
-        }
-        /* eslint-enable require-yield */
       }
 
       const model = new TrackingModel();
@@ -3678,7 +3671,7 @@ describe('Runner.run', () => {
 
       expect(caughtError).toBeInstanceOf(GuardrailExecutionError);
       const guardrailError = caughtError as GuardrailExecutionError;
-      expect(model.calls).toBe(1);
+      expect(model.calls).toHaveLength(1);
       expect(guardrailError.state?._currentTurn).toBe(1);
 
       const restored = await RunState.fromString(
@@ -3697,7 +3690,7 @@ describe('Runner.run', () => {
       expect((resumedError as MaxTurnsExceededError).state?._currentTurn).toBe(
         1,
       );
-      expect(model.calls).toBe(1);
+      expect(model.calls).toHaveLength(1);
     });
 
     it('throws InputGuardrailTripwireTriggered when parallel guardrail trips with structured output and model returns non-JSON', async () => {
@@ -4147,32 +4140,9 @@ describe('Runner.run', () => {
         output: [fakeModelMessage('final')],
         usage: new Usage(),
       };
-      class SimpleStreamingModel implements Model {
-        constructor(private resps: ModelResponse[]) {}
-        async getResponse(_req: ModelRequest): Promise<ModelResponse> {
-          const r = this.resps.shift();
-          if (!r) {
-            throw new Error('No response found');
-          }
-          return r;
-        }
-        async *getStreamedResponse(
-          req: ModelRequest,
-        ): AsyncIterable<protocol.StreamEvent> {
-          const r = await this.getResponse(req);
-          yield {
-            type: 'response_done',
-            response: {
-              id: 'r',
-              usage: {
-                requests: 1,
-                inputTokens: 0,
-                outputTokens: 0,
-                totalTokens: 0,
-              },
-              output: r.output,
-            },
-          } as any;
+      class SimpleStreamingModel extends ScriptedModel {
+        constructor(responses: ModelResponse[]) {
+          super(responses.map(modelResponse));
         }
       }
       const agent = new Agent({
@@ -4203,13 +4173,8 @@ describe('Runner.run', () => {
 
     it('rolls back a turn when request serialization fails before the model call', async () => {
       class TrackingModel extends FakeModel {
-        calls = 0;
-
-        override async getResponse(
-          request: ModelRequest,
-        ): Promise<ModelResponse> {
-          this.calls++;
-          return await super.getResponse(request);
+        get callCount(): number {
+          return this.calls.length;
         }
       }
 
@@ -4229,7 +4194,7 @@ describe('Runner.run', () => {
       const error = await run(agent, state).catch((caught) => caught);
 
       expect(error).toBeInstanceOf(UserError);
-      expect(model.calls).toBe(0);
+      expect(model.callCount).toBe(0);
       expect(state._currentTurn).toBe(0);
 
       const restored = await RunState.fromString(agent, state.toString());
@@ -4238,18 +4203,13 @@ describe('Runner.run', () => {
 
       expect(resumed.finalOutput).toEqual({ value: 'ok' });
       expect(resumed.state._currentTurn).toBe(1);
-      expect(model.calls).toBe(1);
+      expect(model.callCount).toBe(1);
     });
 
     it('preserves an in-progress turn when resumed request serialization fails', async () => {
       class TrackingModel extends FakeModel {
-        calls = 0;
-
-        override async getResponse(
-          request: ModelRequest,
-        ): Promise<ModelResponse> {
-          this.calls++;
-          return await super.getResponse(request);
+        get callCount(): number {
+          return this.calls.length;
         }
       }
 
@@ -4274,7 +4234,7 @@ describe('Runner.run', () => {
       );
 
       expect(error).toBeInstanceOf(UserError);
-      expect(model.calls).toBe(0);
+      expect(model.callCount).toBe(0);
       expect(restored._currentTurn).toBe(1);
       expect(restored._currentTurnInProgress).toBe(true);
 
@@ -4284,7 +4244,7 @@ describe('Runner.run', () => {
 
       expect(resumed.finalOutput).toEqual({ value: 'ok' });
       expect(resumed.state._currentTurn).toBe(1);
-      expect(model.calls).toBe(1);
+      expect(model.callCount).toBe(1);
     });
 
     it('does not enforce maxTurns when maxTurns is null', async () => {
@@ -4687,22 +4647,13 @@ describe('Runner.run', () => {
     ])(
       'empty structured output handler avoids another model turn for $name',
       async ({ output }) => {
-        class CountingModel implements Model {
-          public requests: ModelRequest[] = [];
-
-          constructor(private responses: ModelResponse[]) {}
-
-          async getResponse(request: ModelRequest): Promise<ModelResponse> {
-            this.requests.push(request);
-            const response = this.responses.shift();
-            if (!response) {
-              throw new Error('No response found');
-            }
-            return response;
+        class CountingModel extends ScriptedModel {
+          constructor(responses: ModelResponse[]) {
+            super(responses.map(modelResponse));
           }
 
-          getStreamedResponse(_request: ModelRequest): AsyncIterable<any> {
-            throw new Error('Not implemented');
+          get requests(): readonly ModelRequest[] {
+            return this.calls.map((call) => call.request);
           }
         }
 
@@ -5078,44 +5029,12 @@ describe('Runner.run', () => {
     });
 
     it('uses runner-level reasoningItemIdPolicy when building follow-up turn input', async () => {
-      class RequestRecordingModel implements Model {
-        readonly requests: ModelRequest[] = [];
-        #callCount = 0;
-
-        async getResponse(request: ModelRequest): Promise<ModelResponse> {
-          this.requests.push(request);
-          if (this.#callCount++ === 0) {
-            return {
-              output: [
-                {
-                  type: 'reasoning',
-                  id: 'rs_first',
-                  content: [{ type: 'input_text', text: 'reasoning trace' }],
-                } satisfies protocol.ReasoningItem,
-                {
-                  type: 'function_call',
-                  id: 'fc_first',
-                  callId: 'call_first',
-                  name: 'echo_tool',
-                  status: 'completed',
-                  arguments: '{}',
-                } satisfies protocol.FunctionCallItem,
-              ],
-              usage: new Usage(),
-            };
-          }
-          return {
-            output: [fakeModelMessage('done')],
-            usage: new Usage(),
-          };
-        }
-
-        getStreamedResponse(_request: ModelRequest): AsyncIterable<any> {
-          throw new Error('Not implemented');
-        }
-      }
-
-      const model = new RequestRecordingModel();
+      const model = createReasoningPolicyModel({
+        reasoningId: 'rs_first',
+        functionId: 'fc_first',
+        callId: 'call_first',
+        toolName: 'echo_tool',
+      });
       const echoTool = tool({
         name: 'echo_tool',
         description: 'Echoes a static payload.',
@@ -5133,10 +5052,10 @@ describe('Runner.run', () => {
 
       const result = await runner.run(agent, 'hello');
       expect(result.finalOutput).toBe('done');
-      expect(model.requests).toHaveLength(2);
+      expect(model.calls).toHaveLength(2);
 
       const secondRequestReasoning = getRequestInputItems(
-        model.requests[1],
+        model.calls[1].request,
       ).find(
         (item): item is protocol.ReasoningItem => item.type === 'reasoning',
       );
@@ -5151,44 +5070,12 @@ describe('Runner.run', () => {
     });
 
     it('allows per-run reasoningItemIdPolicy to override runner defaults', async () => {
-      class RequestRecordingModel implements Model {
-        readonly requests: ModelRequest[] = [];
-        #callCount = 0;
-
-        async getResponse(request: ModelRequest): Promise<ModelResponse> {
-          this.requests.push(request);
-          if (this.#callCount++ === 0) {
-            return {
-              output: [
-                {
-                  type: 'reasoning',
-                  id: 'rs_override',
-                  content: [{ type: 'input_text', text: 'reasoning trace' }],
-                } satisfies protocol.ReasoningItem,
-                {
-                  type: 'function_call',
-                  id: 'fc_override',
-                  callId: 'call_override',
-                  name: 'echo_tool',
-                  status: 'completed',
-                  arguments: '{}',
-                } satisfies protocol.FunctionCallItem,
-              ],
-              usage: new Usage(),
-            };
-          }
-          return {
-            output: [fakeModelMessage('done')],
-            usage: new Usage(),
-          };
-        }
-
-        getStreamedResponse(_request: ModelRequest): AsyncIterable<any> {
-          throw new Error('Not implemented');
-        }
-      }
-
-      const model = new RequestRecordingModel();
+      const model = createReasoningPolicyModel({
+        reasoningId: 'rs_override',
+        functionId: 'fc_override',
+        callId: 'call_override',
+        toolName: 'echo_tool',
+      });
       const echoTool = tool({
         name: 'echo_tool',
         description: 'Echoes a static payload.',
@@ -5209,7 +5096,7 @@ describe('Runner.run', () => {
       });
 
       const secondRequestReasoning = getRequestInputItems(
-        model.requests[1],
+        model.calls[1].request,
       ).find(
         (item): item is protocol.ReasoningItem => item.type === 'reasoning',
       );
@@ -5218,44 +5105,12 @@ describe('Runner.run', () => {
     });
 
     it('passes reasoningItemIdPolicy through the run() helper', async () => {
-      class RequestRecordingModel implements Model {
-        readonly requests: ModelRequest[] = [];
-        #callCount = 0;
-
-        async getResponse(request: ModelRequest): Promise<ModelResponse> {
-          this.requests.push(request);
-          if (this.#callCount++ === 0) {
-            return {
-              output: [
-                {
-                  type: 'reasoning',
-                  id: 'rs_helper',
-                  content: [{ type: 'input_text', text: 'reasoning trace' }],
-                } satisfies protocol.ReasoningItem,
-                {
-                  type: 'function_call',
-                  id: 'fc_helper',
-                  callId: 'call_helper',
-                  name: 'echo_tool',
-                  status: 'completed',
-                  arguments: '{}',
-                } satisfies protocol.FunctionCallItem,
-              ],
-              usage: new Usage(),
-            };
-          }
-          return {
-            output: [fakeModelMessage('done')],
-            usage: new Usage(),
-          };
-        }
-
-        getStreamedResponse(_request: ModelRequest): AsyncIterable<any> {
-          throw new Error('Not implemented');
-        }
-      }
-
-      const model = new RequestRecordingModel();
+      const model = createReasoningPolicyModel({
+        reasoningId: 'rs_helper',
+        functionId: 'fc_helper',
+        callId: 'call_helper',
+        toolName: 'echo_tool',
+      });
       const echoTool = tool({
         name: 'echo_tool',
         description: 'Echoes a static payload.',
@@ -5273,7 +5128,7 @@ describe('Runner.run', () => {
       });
 
       const secondRequestReasoning = getRequestInputItems(
-        model.requests[1],
+        model.calls[1].request,
       ).find(
         (item): item is protocol.ReasoningItem => item.type === 'reasoning',
       );
@@ -5282,44 +5137,12 @@ describe('Runner.run', () => {
     });
 
     it('uses serialized reasoningItemIdPolicy when resuming without override', async () => {
-      class RequestRecordingModel implements Model {
-        readonly requests: ModelRequest[] = [];
-        #callCount = 0;
-
-        async getResponse(request: ModelRequest): Promise<ModelResponse> {
-          this.requests.push(request);
-          if (this.#callCount++ === 0) {
-            return {
-              output: [
-                {
-                  type: 'reasoning',
-                  id: 'rs_resume',
-                  content: [{ type: 'input_text', text: 'reasoning trace' }],
-                } satisfies protocol.ReasoningItem,
-                {
-                  type: 'function_call',
-                  id: 'fc_resume',
-                  callId: 'call_resume',
-                  name: 'approval_tool',
-                  status: 'completed',
-                  arguments: '{}',
-                } satisfies protocol.FunctionCallItem,
-              ],
-              usage: new Usage(),
-            };
-          }
-          return {
-            output: [fakeModelMessage('done')],
-            usage: new Usage(),
-          };
-        }
-
-        getStreamedResponse(_request: ModelRequest): AsyncIterable<any> {
-          throw new Error('Not implemented');
-        }
-      }
-
-      const model = new RequestRecordingModel();
+      const model = createReasoningPolicyModel({
+        reasoningId: 'rs_resume',
+        functionId: 'fc_resume',
+        callId: 'call_resume',
+        toolName: 'approval_tool',
+      });
       const approvalTool = tool({
         name: 'approval_tool',
         description: 'Requires approval before execution.',
@@ -5348,9 +5171,9 @@ describe('Runner.run', () => {
       const resumedRun = await run(agent, restoredState, { maxTurns: 1 });
 
       expect(resumedRun.finalOutput).toBe('done');
-      expect(model.requests).toHaveLength(2);
+      expect(model.calls).toHaveLength(2);
       const secondRequestReasoning = getRequestInputItems(
-        model.requests[1],
+        model.calls[1].request,
       ).find(
         (item): item is protocol.ReasoningItem => item.type === 'reasoning',
       );
@@ -5412,13 +5235,8 @@ describe('Runner.run', () => {
       }
 
       class RecordingModel extends FakeModel {
-        lastRequest: ModelRequest | undefined;
-
-        override async getResponse(
-          request: ModelRequest,
-        ): Promise<ModelResponse> {
-          this.lastRequest = request;
-          return super.getResponse(request);
+        get lastRequest(): Readonly<ModelRequest> | undefined {
+          return this.lastCall?.request;
         }
       }
 
@@ -5863,40 +5681,41 @@ describe('Runner.run', () => {
       });
 
       it('does not persist duplicate user input when a model retry succeeds in the same run', async () => {
-        class RetryRecordingModel extends FakeModel {
-          requests: ModelRequest[] = [];
-          attempts = 0;
+        class RetryRecordingModel extends ScriptedModel {
+          readonly requests: ModelRequest[];
 
-          override async getResponse(
-            request: ModelRequest,
-          ): Promise<ModelResponse> {
-            this.requests.push({
-              ...request,
-              input: Array.isArray(request.input)
-                ? (JSON.parse(
-                    JSON.stringify(request.input),
-                  ) as AgentInputItem[])
-                : request.input,
-            });
-            this.attempts += 1;
+          constructor(response: ModelResponse) {
+            const requests: ModelRequest[] = [];
+            const record = (request: Readonly<ModelRequest>) => {
+              requests.push(cloneModelRequest(request));
+            };
+            super([
+              modelResponder((call) => {
+                record(call.request);
+                const error = new Error('temporary failure') as Error & {
+                  statusCode?: number;
+                };
+                error.statusCode = 503;
+                throw error;
+              }),
+              modelResponder((call) => {
+                record(call.request);
+                return response;
+              }),
+            ]);
+            this.requests = requests;
+          }
 
-            if (this.attempts === 1) {
-              const error = new Error('temporary failure');
-              (error as Error & { statusCode?: number }).statusCode = 503;
-              throw error;
-            }
-
-            return await super.getResponse(request);
+          get attempts(): number {
+            return this.calls.length;
           }
         }
 
-        const model = new RetryRecordingModel([
-          {
-            ...TEST_MODEL_RESPONSE_BASIC,
-            output: [fakeModelMessage('retry response')],
-            usage: new Usage({ requests: 1 }),
-          },
-        ]);
+        const model = new RetryRecordingModel({
+          ...TEST_MODEL_RESPONSE_BASIC,
+          output: [fakeModelMessage('retry response')],
+          usage: new Usage({ requests: 1 }),
+        });
         const agent = new Agent({
           name: 'RetrySessionAgent',
           model,
@@ -6454,43 +6273,18 @@ describe('Runner.run', () => {
 
   describe('callModelInputFilter', () => {
     class FilterTrackingModel extends FakeModel {
-      lastRequest?: ModelRequest;
-
-      override async getResponse(
-        request: ModelRequest,
-      ): Promise<ModelResponse> {
-        this.lastRequest = request;
-        return await super.getResponse(request);
+      get lastRequest(): Readonly<ModelRequest> | undefined {
+        return this.lastCall?.request;
       }
     }
 
-    class FilterStreamingModel implements Model {
-      lastRequest?: ModelRequest;
-
-      constructor(private readonly response: ModelResponse) {}
-
-      async getResponse(request: ModelRequest): Promise<ModelResponse> {
-        this.lastRequest = request;
-        return this.response;
+    class FilterStreamingModel extends ScriptedModel {
+      constructor(response: ModelResponse) {
+        super([modelResponse({ ...response, responseId: 'stream-filter' })]);
       }
 
-      async *getStreamedResponse(
-        request: ModelRequest,
-      ): AsyncIterable<protocol.StreamEvent> {
-        this.lastRequest = request;
-        yield {
-          type: 'response_done',
-          response: {
-            id: 'stream-filter',
-            usage: {
-              requests: 1,
-              inputTokens: 0,
-              outputTokens: 0,
-              totalTokens: 0,
-            },
-            output: this.response.output,
-          },
-        } as protocol.StreamEvent;
+      get lastRequest(): Readonly<ModelRequest> | undefined {
+        return this.lastCall?.request;
       }
     }
 
@@ -7324,20 +7118,20 @@ describe('Runner.run', () => {
     });
 
     it('allows callModelInputFilter to override omitted reasoning IDs', async () => {
-      class ReasoningTrackingModel extends FakeModel {
-        requests: ModelRequest[] = [];
+      class ReasoningTrackingModel extends ScriptedModel {
+        readonly requests: ModelRequest[];
 
-        override async getResponse(
-          request: ModelRequest,
-        ): Promise<ModelResponse> {
-          const cloned: ModelRequest = {
-            ...request,
-            input: Array.isArray(request.input)
-              ? (JSON.parse(JSON.stringify(request.input)) as AgentInputItem[])
-              : request.input,
-          };
-          this.requests.push(cloned);
-          return await super.getResponse(request);
+        constructor(responses: ModelResponse[]) {
+          const requests: ModelRequest[] = [];
+          super(
+            responses.map((response) =>
+              modelResponder((call) => {
+                requests.push(cloneModelRequest(call.request));
+                return response;
+              }),
+            ),
+          );
+          this.requests = requests;
         }
       }
 
@@ -7412,30 +7206,20 @@ describe('Runner.run', () => {
     });
 
     it('keeps server conversation tracking aligned with filtered inputs', async () => {
-      class ConversationTrackingModel implements Model {
-        requests: ModelRequest[] = [];
+      class ConversationTrackingModel extends ScriptedModel {
+        readonly requests: ModelRequest[];
 
-        constructor(private readonly responses: ModelResponse[]) {}
-
-        async getResponse(request: ModelRequest): Promise<ModelResponse> {
-          const cloned: ModelRequest = {
-            ...request,
-            input: Array.isArray(request.input)
-              ? (JSON.parse(JSON.stringify(request.input)) as AgentInputItem[])
-              : request.input,
-          };
-          this.requests.push(cloned);
-          const response = this.responses.shift();
-          if (!response) {
-            throw new Error('No response configured');
-          }
-          return response;
-        }
-
-        getStreamedResponse(
-          _request: ModelRequest,
-        ): AsyncIterable<protocol.StreamEvent> {
-          throw new Error('Not implemented');
+        constructor(responses: ModelResponse[]) {
+          const requests: ModelRequest[] = [];
+          super(
+            responses.map((response) =>
+              modelResponder((call) => {
+                requests.push(cloneModelRequest(call.request));
+                return response;
+              }),
+            ),
+          );
+          this.requests = requests;
         }
       }
 
@@ -7523,30 +7307,20 @@ describe('Runner.run', () => {
     });
 
     it('stops requeuing sanitized inputs when filters replace them', async () => {
-      class RedactionTrackingModel implements Model {
-        requests: ModelRequest[] = [];
+      class RedactionTrackingModel extends ScriptedModel {
+        readonly requests: ModelRequest[];
 
-        constructor(private readonly responses: ModelResponse[]) {}
-
-        async getResponse(request: ModelRequest): Promise<ModelResponse> {
-          const cloned: ModelRequest = {
-            ...request,
-            input: Array.isArray(request.input)
-              ? (JSON.parse(JSON.stringify(request.input)) as AgentInputItem[])
-              : request.input,
-          };
-          this.requests.push(cloned);
-          const response = this.responses.shift();
-          if (!response) {
-            throw new Error('No response configured');
-          }
-          return response;
-        }
-
-        getStreamedResponse(
-          _request: ModelRequest,
-        ): AsyncIterable<protocol.StreamEvent> {
-          throw new Error('Not implemented');
+        constructor(responses: ModelResponse[]) {
+          const requests: ModelRequest[] = [];
+          super(
+            responses.map((response) =>
+              modelResponder((call) => {
+                requests.push(cloneModelRequest(call.request));
+                return response;
+              }),
+            ),
+          );
+          this.requests = requests;
         }
       }
 
@@ -7639,30 +7413,20 @@ describe('Runner.run', () => {
     });
 
     it('does not requeue filtered tool outputs in server-managed conversations', async () => {
-      class ConversationTrackingModel implements Model {
-        requests: ModelRequest[] = [];
+      class ConversationTrackingModel extends ScriptedModel {
+        readonly requests: ModelRequest[];
 
-        constructor(private readonly responses: ModelResponse[]) {}
-
-        async getResponse(request: ModelRequest): Promise<ModelResponse> {
-          const cloned: ModelRequest = {
-            ...request,
-            input: Array.isArray(request.input)
-              ? (JSON.parse(JSON.stringify(request.input)) as AgentInputItem[])
-              : request.input,
-          };
-          this.requests.push(cloned);
-          const response = this.responses.shift();
-          if (!response) {
-            throw new Error('No response configured');
-          }
-          return response;
-        }
-
-        getStreamedResponse(
-          _request: ModelRequest,
-        ): AsyncIterable<protocol.StreamEvent> {
-          throw new Error('Not implemented');
+        constructor(responses: ModelResponse[]) {
+          const requests: ModelRequest[] = [];
+          super(
+            responses.map((response) =>
+              modelResponder((call) => {
+                requests.push(cloneModelRequest(call.request));
+                return response;
+              }),
+            ),
+          );
+          this.requests = requests;
         }
       }
 
@@ -7762,29 +7526,9 @@ describe('Runner.run', () => {
     });
 
     it('preserves providerData when saving streaming session items', async () => {
-      class MetadataStreamingModel implements Model {
-        constructor(private readonly response: ModelResponse) {}
-
-        async getResponse(_request: ModelRequest): Promise<ModelResponse> {
-          return this.response;
-        }
-
-        async *getStreamedResponse(
-          _request: ModelRequest,
-        ): AsyncIterable<protocol.StreamEvent> {
-          yield {
-            type: 'response_done',
-            response: {
-              id: 'meta-stream',
-              usage: {
-                requests: 1,
-                inputTokens: 0,
-                outputTokens: 0,
-                totalTokens: 0,
-              },
-              output: this.response.output,
-            },
-          } as protocol.StreamEvent;
+      class MetadataStreamingModel extends ScriptedModel {
+        constructor(response: ModelResponse) {
+          super([modelResponse({ ...response, responseId: 'meta-stream' })]);
         }
       }
 
@@ -7855,17 +7599,12 @@ describe('Runner.run', () => {
 
   describe('gpt-5 default model adjustments', () => {
     class InspectableModel extends FakeModel {
-      lastRequest: ModelRequest | undefined;
-
       constructor(response: ModelResponse) {
         super([response]);
       }
 
-      override async getResponse(
-        request: ModelRequest,
-      ): Promise<ModelResponse> {
-        this.lastRequest = request;
-        return await super.getResponse(request);
+      get lastRequest(): Readonly<ModelRequest> | undefined {
+        return this.lastCall?.request;
       }
     }
 
@@ -8057,42 +7796,28 @@ describe('Runner.run', () => {
       }
     }
 
-    class TrackingModel implements Model {
-      public requests: ModelRequest[] = [];
-      public firstRequest: ModelRequest | undefined;
-      public lastRequest: ModelRequest | undefined;
+    class TrackingModel extends ScriptedModel {
+      public requests: ModelRequest[];
 
-      constructor(private readonly responses: TurnResponse[]) {}
-
-      private recordRequest(request: ModelRequest) {
-        const clonedInput: string | AgentInputItem[] =
-          typeof request.input === 'string'
-            ? request.input
-            : (JSON.parse(JSON.stringify(request.input)) as AgentInputItem[]);
-
-        const recorded: ModelRequest = {
-          ...request,
-          input: clonedInput,
-        };
-
-        this.requests.push(recorded);
-        this.lastRequest = recorded;
-        this.firstRequest ??= recorded;
+      constructor(responses: TurnResponse[]) {
+        const requests: ModelRequest[] = [];
+        super(
+          responses.map((response) =>
+            modelResponder((call) => {
+              requests.push(cloneModelRequest(call.request));
+              return response;
+            }),
+          ),
+        );
+        this.requests = requests;
       }
 
-      async getResponse(request: ModelRequest): Promise<ModelResponse> {
-        this.recordRequest(request);
-        const response = this.responses.shift();
-        if (!response) {
-          throw new Error('No response configured');
-        }
-        return response;
+      get firstRequest(): ModelRequest | undefined {
+        return this.requests[0];
       }
 
-      getStreamedResponse(
-        _request: ModelRequest,
-      ): AsyncIterable<protocol.StreamEvent> {
-        throw new Error('Not implemented');
+      get lastRequest(): ModelRequest | undefined {
+        return this.requests.at(-1);
       }
     }
 
@@ -8125,21 +7850,15 @@ describe('Runner.run', () => {
     });
 
     it('marks server-managed inputs as sent only after a successful response', async () => {
-      /* eslint-disable require-yield */
-      class SingleResponseModel implements Model {
-        public readonly requests: ModelRequest[] = [];
-        constructor(private readonly response: ModelResponse) {}
-
-        async getResponse(request: ModelRequest): Promise<ModelResponse> {
-          this.requests.push(request);
-          return this.response;
+      class SingleResponseModel extends ScriptedModel {
+        constructor(response: ModelResponse) {
+          super([modelResponse(response)]);
         }
 
-        async *getStreamedResponse(): AsyncIterable<protocol.StreamEvent> {
-          throw new Error('not used');
+        get requests(): readonly ModelRequest[] {
+          return this.calls.map((call) => call.request);
         }
       }
-      /* eslint-enable require-yield */
 
       const markSpy = vi.spyOn(
         ServerConversationTracker.prototype,
@@ -8165,25 +7884,13 @@ describe('Runner.run', () => {
     });
 
     it('does not mark server inputs as sent when the model call fails before sending', async () => {
-      /* eslint-disable require-yield */
-      class ThrowingModel implements Model {
-        async getResponse(): Promise<ModelResponse> {
-          throw new Error('boom');
-        }
-
-        async *getStreamedResponse(): AsyncIterable<protocol.StreamEvent> {
-          throw new Error('not used');
-        }
-      }
-      /* eslint-enable require-yield */
-
       const markSpy = vi.spyOn(
         ServerConversationTracker.prototype,
         'markInputAsSent',
       );
       const agent = new Agent({
         name: 'MarkFailure',
-        model: new ThrowingModel(),
+        model: new ScriptedModel([modelError(new Error('boom'))]),
       });
       const runner = new Runner();
 
@@ -8346,20 +8053,17 @@ describe('Runner.run', () => {
     });
 
     it('does not retry a failed server-managed request before the server ack is recorded', async () => {
-      class RetryTrackingModel extends TrackingModel {
-        attempts = 0;
+      class RetryTrackingModel extends ScriptedModel {
+        constructor() {
+          const error = new Error('temporary conversation failure') as Error & {
+            statusCode?: number;
+          };
+          error.statusCode = 503;
+          super([modelError(error)]);
+        }
 
-        override async getResponse(
-          request: ModelRequest,
-        ): Promise<ModelResponse> {
-          this.attempts += 1;
-          if (this.attempts === 1) {
-            this['recordRequest'](request);
-            const error = new Error('temporary conversation failure');
-            (error as Error & { statusCode?: number }).statusCode = 503;
-            throw error;
-          }
-          return await super.getResponse(request);
+        get requests(): readonly Readonly<ModelRequest>[] {
+          return this.calls.map((call) => call.request);
         }
       }
 
@@ -8367,10 +8071,7 @@ describe('Runner.run', () => {
         ServerConversationTracker.prototype,
         'markInputAsSent',
       );
-      const model = new RetryTrackingModel([
-        buildResponse([buildToolCall('call-retry', 'foo')], 'resp-retry-1'),
-        buildResponse([fakeModelMessage('done')], 'resp-retry-2'),
-      ]);
+      const model = new RetryTrackingModel();
 
       const agent = new Agent({
         name: 'RetryConversationAgent',
@@ -8862,30 +8563,28 @@ describe('Runner.run', () => {
     });
 
     it('does not retry a failed previousResponseId request before the server ack is recorded', async () => {
-      class RetryTrackingModel extends TrackingModel {
-        attempts = 0;
+      class RetryTrackingModel extends ScriptedModel {
+        readonly error: Error & { statusCode?: number };
 
-        override async getResponse(
-          request: ModelRequest,
-        ): Promise<ModelResponse> {
-          this.attempts += 1;
-          if (this.attempts === 1) {
-            this['recordRequest'](request);
-            const error = new Error('temporary previousResponseId failure');
-            (error as Error & { statusCode?: number }).statusCode = 503;
-            throw error;
-          }
-          return await super.getResponse(request);
+        constructor() {
+          const error = new Error(
+            'temporary previousResponseId failure',
+          ) as Error & { statusCode?: number };
+          error.statusCode = 503;
+          super([modelError(error)]);
+          this.error = error;
+        }
+
+        get requests(): readonly Readonly<ModelRequest>[] {
+          return this.calls.map((call) => call.request);
+        }
+
+        get attempts(): number {
+          return this.calls.length;
         }
       }
 
-      const model = new RetryTrackingModel([
-        buildResponse(
-          [buildToolCall('call-prev-retry', 'foo')],
-          'resp-prev-retry-1',
-        ),
-        buildResponse([fakeModelMessage('done')], 'resp-prev-retry-2'),
-      ]);
+      const model = new RetryTrackingModel();
 
       const agent = new Agent({
         name: 'RetryPreviousResponseAgent',
@@ -8915,34 +8614,23 @@ describe('Runner.run', () => {
     });
 
     it('does not retry a streamed server-managed request before the server ack is recorded', async () => {
-      /* eslint-disable require-yield */
-      class RetryStreamingTrackingModel implements Model {
-        public requests: ModelRequest[] = [];
-        attempts = 0;
-
-        async getResponse(): Promise<ModelResponse> {
-          throw new Error('not used');
+      class RetryStreamingTrackingModel extends ScriptedModel {
+        constructor() {
+          const error = new Error(
+            'temporary streamed conversation failure',
+          ) as Error & { statusCode?: number };
+          error.statusCode = 503;
+          super([modelError(error)]);
         }
 
-        async *getStreamedResponse(
-          request: ModelRequest,
-        ): AsyncIterable<protocol.StreamEvent> {
-          this.requests.push({
-            ...request,
-            input:
-              typeof request.input === 'string'
-                ? request.input
-                : (JSON.parse(
-                    JSON.stringify(request.input),
-                  ) as AgentInputItem[]),
-          });
-          this.attempts += 1;
-          const error = new Error('temporary streamed conversation failure');
-          (error as Error & { statusCode?: number }).statusCode = 503;
-          throw error;
+        get requests(): readonly Readonly<ModelRequest>[] {
+          return this.calls.map((call) => call.request);
+        }
+
+        get attempts(): number {
+          return this.calls.length;
         }
       }
-      /* eslint-enable require-yield */
 
       const model = new RetryStreamingTrackingModel();
       const markSpy = vi.spyOn(
@@ -9566,13 +9254,8 @@ describe('Runner.run', () => {
 
   describe('inline compaction items', () => {
     class RecordingModel extends FakeModel {
-      readonly requests: ModelRequest[] = [];
-
-      override async getResponse(
-        request: ModelRequest,
-      ): Promise<ModelResponse> {
-        this.requests.push(request);
-        return super.getResponse(request);
+      get requests(): readonly Readonly<ModelRequest>[] {
+        return this.calls.map((call) => call.request);
       }
     }
 

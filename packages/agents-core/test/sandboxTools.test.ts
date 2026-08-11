@@ -13,6 +13,7 @@ import {
   type ViewImageArgs,
   type WriteStdinArgs,
 } from '../src/sandbox';
+import { ScriptedModel } from '../src/testing';
 
 class FakeEditor implements Editor {
   readonly calls: ApplyPatchOperation[] = [];
@@ -39,25 +40,9 @@ class FakeEditor implements Editor {
   }
 }
 
-class FakeResponsesModel {
-  async getResponse() {
-    throw new Error('not used');
-  }
+class FakeResponsesModel extends ScriptedModel {}
 
-  async *getStreamedResponse() {
-    yield* [];
-  }
-}
-
-class FakeChatCompletionsModel {
-  async getResponse() {
-    throw new Error('not used');
-  }
-
-  async *getStreamedResponse() {
-    yield* [];
-  }
-}
+class FakeChatCompletionsModel extends ScriptedModel {}
 
 type FakeSessionState = SandboxSessionState & {
   sessionId?: string;

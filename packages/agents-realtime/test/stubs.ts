@@ -2,13 +2,13 @@ import {
   Agent,
   Model,
   ModelProvider,
-  ModelRequest,
   ModelResponse,
   protocol,
   tool,
   Usage,
 } from '@openai/agents-core';
 import { RuntimeEventEmitter } from '@openai/agents-core/_shims';
+import { ScriptedModel, modelResponse } from '@openai/agents-core/testing';
 import { EventEmitterDelegate } from '@openai/agents-core/utils';
 import { z } from 'zod';
 import type {
@@ -97,22 +97,9 @@ export const TEST_TOOL = tool({
   },
 });
 
-export class FakeModel implements Model {
-  constructor(private _responses: ModelResponse[] = []) {}
-
-  async getResponse(_request: ModelRequest): Promise<ModelResponse> {
-    const response = this._responses.shift();
-    if (!response) {
-      throw new Error('No response found');
-    }
-    return response;
-  }
-
-  /* eslint-disable require-yield */
-  async *getStreamedResponse(
-    _request: ModelRequest,
-  ): AsyncIterable<protocol.StreamEvent> {
-    throw new Error('Not implemented');
+export class FakeModel extends ScriptedModel {
+  constructor(responses: ModelResponse[] = []) {
+    super(responses.map(modelResponse));
   }
 }
 
