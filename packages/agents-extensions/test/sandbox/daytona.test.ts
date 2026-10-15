@@ -282,6 +282,106 @@ describe('DaytonaSandboxClient', () => {
     expect(createMock).not.toHaveBeenCalled();
   });
 
+  function rootChmodCommand(mode: string, path: string): string | undefined {
+    return executeCommandMock.mock.calls
+      .map(([command]) => String(command))
+      .find(
+        (command) =>
+          command.includes("target_user='root'") &&
+          command.includes(`chmod ${mode} -- `) &&
+          command.includes(`${path}'`),
+      );
+  }
+
+  test('applies manifest entry permissions as root when creating sandboxes', async () => {
+    const client = new DaytonaSandboxClient();
+
+    await client.create(
+      new Manifest({
+        entries: {
+          reference: {
+            type: 'dir',
+            permissions: 'dr-xr-xr-x',
+            children: {
+              'guide.md': {
+                type: 'file',
+                content: '# Guide\n',
+                permissions: '-r--r--r--',
+              },
+            },
+          },
+          scratch: { type: 'dir', permissions: 'drwxrwxrwt' },
+          'notes.txt': { type: 'file', content: 'notes\n' },
+        },
+      }),
+    );
+
+    expect(uploadFileMock).toHaveBeenCalledWith(
+      Buffer.from('# Guide\n'),
+      '/home/daytona/workspace/reference/guide.md',
+    );
+    expect(
+      rootChmodCommand('0555', '/home/daytona/workspace/reference'),
+    ).toBeDefined();
+    expect(
+      rootChmodCommand('0444', '/home/daytona/workspace/reference/guide.md'),
+    ).toBeDefined();
+    expect(
+      rootChmodCommand('1777', '/home/daytona/workspace/scratch'),
+    ).toBeDefined();
+    expect(
+      rootChmodCommand('0755', '/home/daytona/workspace/notes.txt'),
+    ).toBeDefined();
+  });
+
+  test('applies entry permissions when applying manifests and materializing entries', async () => {
+    const client = new DaytonaSandboxClient();
+    const session = await client.create(new Manifest());
+    executeCommandMock.mockClear();
+
+    await session.applyManifest(
+      new Manifest({
+        entries: {
+          'next.txt': {
+            type: 'file',
+            content: 'next\n',
+            permissions: '-rw-r-----',
+          },
+        },
+      }),
+    );
+    await session.materializeEntry({
+      path: 'readonly',
+      entry: { type: 'dir', permissions: 'dr-xr-x---' },
+    });
+
+    expect(
+      rootChmodCommand('0640', '/home/daytona/workspace/next.txt'),
+    ).toBeDefined();
+    expect(
+      rootChmodCommand('0550', '/home/daytona/workspace/readonly'),
+    ).toBeDefined();
+  });
+
+  test('rejects entry group ownership before creating sandboxes', async () => {
+    const client = new DaytonaSandboxClient();
+
+    await expect(
+      client.create(
+        new Manifest({
+          entries: {
+            'notes.txt': {
+              type: 'file',
+              content: 'notes\n',
+              group: { name: 'agents' },
+            },
+          },
+        }),
+      ),
+    ).rejects.toThrow(/does not support sandbox entry group ownership yet/);
+    expect(createMock).not.toHaveBeenCalled();
+  });
+
   test('remaps default manifest roots when applying manifests to sessions', async () => {
     const client = new DaytonaSandboxClient();
     const session = await client.create(new Manifest());

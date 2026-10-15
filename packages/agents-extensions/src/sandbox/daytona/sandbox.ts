@@ -47,6 +47,7 @@ import {
   assertSandboxEntryMetadataSupported,
   assertSandboxManifestMetadataSupported,
   MOUNT_MANIFEST_METADATA_SUPPORT,
+  type SandboxManifestMetadataSupport,
   closeRemoteSessionOnManifestError,
   resolveCreateArchiveLimits,
   cloneManifestWithRoot,
@@ -123,6 +124,10 @@ import {
 const DEFAULT_WORKSPACE_ROOT = '/home/daytona/workspace';
 const DEFAULT_EXPOSED_PORT_URL_TTL_S = 60;
 const DAYTONA_DELETE_RETRY_DELAYS_MS = [1_000, 2_000, 4_000];
+const DAYTONA_MANIFEST_METADATA_SUPPORT: SandboxManifestMetadataSupport = {
+  ...MOUNT_MANIFEST_METADATA_SUPPORT,
+  entryPermissions: true,
+};
 
 type DaytonaClientLike = {
   create(
@@ -613,7 +618,7 @@ export class DaytonaSandboxSession implements SandboxSession<DaytonaSandboxSessi
       'DaytonaSandboxClient',
       args.path,
       args.entry,
-      MOUNT_MANIFEST_METADATA_SUPPORT,
+      DAYTONA_MANIFEST_METADATA_SUPPORT,
     );
     const options = this.manifestMaterializationOptions(args.runAs);
     const logicalPath = resolveSandboxRelativePath(
@@ -695,7 +700,7 @@ export class DaytonaSandboxSession implements SandboxSession<DaytonaSandboxSessi
     assertSandboxManifestMetadataSupported(
       'DaytonaSandboxClient',
       resolvedManifest,
-      MOUNT_MANIFEST_METADATA_SUPPORT,
+      DAYTONA_MANIFEST_METADATA_SUPPORT,
     );
     const options = this.manifestMaterializationOptions(runAs);
     const preparedTransition = await prepareMaterializedManifestTransition(
@@ -970,7 +975,7 @@ export class DaytonaSandboxSession implements SandboxSession<DaytonaSandboxSessi
           await this.resolveRemoteCredentialPath(path),
         validateManifest: validateRcloneMountEnvironmentCredentialExposure,
       },
-      support: MOUNT_MANIFEST_METADATA_SUPPORT,
+      support: DAYTONA_MANIFEST_METADATA_SUPPORT,
     });
   }
 
@@ -1330,7 +1335,7 @@ export class DaytonaSandboxClient implements SandboxClient<
     assertSandboxManifestMetadataSupported(
       'DaytonaSandboxClient',
       resolvedManifest,
-      MOUNT_MANIFEST_METADATA_SUPPORT,
+      DAYTONA_MANIFEST_METADATA_SUPPORT,
     );
     const client = await createDaytonaClient(resolvedOptions);
 
